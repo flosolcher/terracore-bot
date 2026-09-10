@@ -461,8 +461,8 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        let mut cfg = Self::from_str(&text)
-            .with_context(|| format!("parsing config {}", path.display()))?;
+        let mut cfg =
+            Self::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
         cfg.path = path.to_path_buf();
         Ok(cfg)
     }
@@ -693,8 +693,31 @@ max_enemy_dodge = 5.0
             .to_string();
         assert!(err.contains("defaults"), "{err}");
 
-        let err = Config::from_str("[genral]\n[accounts.a]\n").unwrap_err().to_string();
+        let err = Config::from_str("[genral]\n[accounts.a]\n")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("unknown top-level section"), "{err}");
+    }
+
+    /// The shipped example states a value for every setting and calls them the
+    /// defaults. If a compiled default changes and the file is not updated, the file
+    /// is quietly lying to whoever copies it -- which is the whole failure mode a
+    /// second copy of anything invites.
+    #[test]
+    fn the_example_config_states_the_actual_compiled_defaults() {
+        let example = include_str!("../config.example.toml");
+        let documented = Config::default_settings(example).expect("the shipped example must parse");
+
+        let as_toml = |s: &Settings| toml::Value::try_from(s).unwrap();
+        assert_eq!(
+            as_toml(&documented),
+            as_toml(&Settings::default()),
+            "config.example.toml no longer matches the compiled defaults"
+        );
+
+        // And it is a config the bot would actually accept.
+        let loadable = example.replace("[accounts.youraccount]", "[accounts.probe]");
+        Config::from_str(&loadable).expect("the shipped example must load");
     }
 
     #[test]

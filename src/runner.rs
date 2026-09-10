@@ -143,7 +143,9 @@ impl Bot {
                         "blacklist updated"
                     );
                 }
-                Err(e) => warn!(%url, error = %e, "could not fetch the blacklist; keeping the current one"),
+                Err(e) => {
+                    warn!(%url, error = %e, "could not fetch the blacklist; keeping the current one")
+                }
             }
         }
     }
@@ -359,11 +361,7 @@ impl Bot {
     /// the wallet and the dry-run flag shape objects built once at start-up, so a
     /// change there is reported rather than half-applied.
     fn reload_if_asked(&mut self) {
-        let asked = {
-            let mut control = self.shared.control();
-            std::mem::take(&mut control.reload)
-        };
-        if !asked {
+        if !self.shared.control().take_reload() {
             return;
         }
         match Config::load(&self.config.path) {
@@ -386,7 +384,9 @@ impl Bot {
                 self.rebuild_blacklist();
                 info!(accounts = self.config.accounts.len(), "config reloaded");
             }
-            Err(e) => warn!(error = %format!("{e:#}"), "the edited config would not load; keeping the running one"),
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "the edited config would not load; keeping the running one")
+            }
         }
     }
 
@@ -400,10 +400,9 @@ impl Bot {
                     info!("paused; no new cycles will start until resumed");
                 }
                 was_paused = true;
-                // A plain wait, not `sleep_until_woken`: that one consumes `run_now`,
-                // so a "run now" pressed while paused used to be swallowed and never
-                // acted on. Left set, it fires as soon as the bot is resumed.
-                self.wait(5);
+                // Safe to use the same sleep here: `take_run_now` refuses to consume
+                // the flag while paused, so a request made now survives to resume.
+                self.sleep_until_woken(5);
             } else {
                 if was_paused {
                     info!("resumed");
@@ -441,14 +440,9 @@ impl Bot {
             if self.stopping() {
                 return;
             }
-            {
-                let mut control = self.shared.control();
-                if control.run_now {
-                    control.run_now = false;
-                    drop(control);
-                    info!("running a cycle on request");
-                    return;
-                }
+            if self.shared.control().take_run_now() {
+                info!("running a cycle on request");
+                return;
             }
             std::thread::sleep(Duration::from_secs(1));
         }

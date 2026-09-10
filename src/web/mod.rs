@@ -227,7 +227,12 @@ impl Panel {
                     .accounts
                     .iter()
                     .filter(|(name, _)| session.role.may_read(&session.account, name))
-                    .map(|(name, status)| (name.clone(), serde_json::to_value(status).unwrap_or(Value::Null)))
+                    .map(|(name, status)| {
+                        (
+                            name.clone(),
+                            serde_json::to_value(status).unwrap_or(Value::Null),
+                        )
+                    })
                     .collect();
                 let control = self.shared.control().clone();
                 Ok(ok(&json!({
@@ -247,8 +252,8 @@ impl Panel {
                 let Some(session) = self.session(request) else {
                     return Ok(unauthorized());
                 };
-                let text = std::fs::read_to_string(&self.config_path)
-                    .context("reading the config")?;
+                let text =
+                    std::fs::read_to_string(&self.config_path).context("reading the config")?;
                 let config = Config::from_str(&text)?;
                 let defaults = Config::default_settings(&text)?;
 
@@ -349,7 +354,10 @@ impl Panel {
                 // `strip_prefix`, not `trim_start_matches`: the latter strips the
                 // pattern repeatedly, so `/api/accounts//api/accounts/alice` would
                 // have resolved to `alice`.
-                let name = path.strip_prefix("/api/accounts/").unwrap_or_default().to_string();
+                let name = path
+                    .strip_prefix("/api/accounts/")
+                    .unwrap_or_default()
+                    .to_string();
                 // Nothing downstream decodes percent-escapes, so the name has to be
                 // one that never needs them. Hive account names never do.
                 if !is_hive_account_name(&name) {
@@ -431,10 +439,8 @@ impl Panel {
 
 fn write_atomically(path: &Path, text: &str) -> Result<()> {
     let temporary = path.with_extension("toml.tmp");
-    std::fs::write(&temporary, text)
-        .with_context(|| format!("writing {}", temporary.display()))?;
-    std::fs::rename(&temporary, path)
-        .with_context(|| format!("replacing {}", path.display()))?;
+    std::fs::write(&temporary, text).with_context(|| format!("writing {}", temporary.display()))?;
+    std::fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
 }
 
@@ -561,7 +567,10 @@ mod tests {
     #[test]
     fn a_cookie_header_yields_the_named_value() {
         let header = "other=1; tc_session=abc123; another=2";
-        assert_eq!(cookie_value(header, SESSION_COOKIE).as_deref(), Some("abc123"));
+        assert_eq!(
+            cookie_value(header, SESSION_COOKIE).as_deref(),
+            Some("abc123")
+        );
         assert_eq!(cookie_value(header, "nothing-here"), None);
         assert_eq!(cookie_value("", SESSION_COOKIE), None);
         // A prefix of the name is not the name.
@@ -640,7 +649,8 @@ delay_secs = 20
 "#;
 
     fn start(name: &str) -> Fixture {
-        let config_path = std::env::temp_dir().join(format!("tc-bot-test-{name}-{}.toml", std::process::id()));
+        let config_path =
+            std::env::temp_dir().join(format!("tc-bot-test-{name}-{}.toml", std::process::id()));
         std::fs::write(&config_path, CONFIG).unwrap();
         let config = Config::load(&config_path).unwrap();
         let shared = Shared::new(50);
@@ -698,11 +708,16 @@ delay_secs = 20
                 request = request.set("Cookie", &format!("{SESSION_COOKIE}={token}"));
             }
             let result = match body {
-                Some(body) => request.set("Content-Type", "application/json").send_string(body),
+                Some(body) => request
+                    .set("Content-Type", "application/json")
+                    .send_string(body),
                 None => request.call(),
             };
             match result {
-                Ok(response) => (response.status(), response.into_string().unwrap_or_default()),
+                Ok(response) => (
+                    response.status(),
+                    response.into_string().unwrap_or_default(),
+                ),
                 Err(ureq::Error::Status(code, response)) => {
                     (code, response.into_string().unwrap_or_default())
                 }
@@ -714,8 +729,14 @@ delay_secs = 20
     #[test]
     fn an_admin_sees_every_account_and_an_operator_sees_only_its_own() {
         let f = start("scope");
-        f.shared.status().accounts.insert("alice".into(), Default::default());
-        f.shared.status().accounts.insert("bob".into(), Default::default());
+        f.shared
+            .status()
+            .accounts
+            .insert("alice".into(), Default::default());
+        f.shared
+            .status()
+            .accounts
+            .insert("bob".into(), Default::default());
 
         let admin = f.session("adminuser", WebRole::Admin);
         let (status, body) = f.request("GET", "/api/status", Some(&admin), None);
@@ -726,7 +747,10 @@ delay_secs = 20
         let (status, body) = f.request("GET", "/api/status", Some(&operator), None);
         assert_eq!(status, 200);
         assert!(body.contains("bob"), "{body}");
-        assert!(!body.contains("alice"), "an operator must not see another account: {body}");
+        assert!(
+            !body.contains("alice"),
+            "an operator must not see another account: {body}"
+        );
     }
 
     #[test]
@@ -741,13 +765,19 @@ delay_secs = 20
         .unwrap();
 
         let before = std::fs::read_to_string(&f.config_path).unwrap();
-        let (status, body) = f.request("PUT", "/api/accounts/alice", Some(&operator), Some(&settings));
+        let (status, body) = f.request(
+            "PUT",
+            "/api/accounts/alice",
+            Some(&operator),
+            Some(&settings),
+        );
         assert_eq!(status, 403, "{body}");
         // A refusal must leave the file untouched, not merely refuse to answer.
         assert_eq!(std::fs::read_to_string(&f.config_path).unwrap(), before);
         assert!(!f.shared.control().reload);
 
-        let (status, body) = f.request("PUT", "/api/accounts/bob", Some(&operator), Some(&settings));
+        let (status, body) =
+            f.request("PUT", "/api/accounts/bob", Some(&operator), Some(&settings));
         assert_eq!(status, 200, "{body}");
     }
 
@@ -759,7 +789,8 @@ delay_secs = 20
         let mut settings = crate::config::Settings::default();
         settings.attack.delay_secs = 77;
         settings.upgrade.enabled = true;
-        let body = serde_json::to_string(&json!({ "enabled": false, "settings": settings })).unwrap();
+        let body =
+            serde_json::to_string(&json!({ "enabled": false, "settings": settings })).unwrap();
 
         let (status, response) = f.request("PUT", "/api/accounts/alice", Some(&admin), Some(&body));
         assert_eq!(status, 200, "{response}");
@@ -769,12 +800,26 @@ delay_secs = 20
         assert!(written.contains("enabled = false"), "{written}");
         // Still a config the bot can load, and still the other account's business.
         let reloaded = Config::from_str(&written).unwrap();
-        let alice = reloaded.accounts.iter().find(|a| a.name == "alice").unwrap();
+        let alice = reloaded
+            .accounts
+            .iter()
+            .find(|a| a.name == "alice")
+            .unwrap();
         assert_eq!(alice.settings.attack.delay_secs, 77);
         assert!(!alice.enabled);
-        assert!(reloaded.accounts.iter().find(|a| a.name == "bob").unwrap().enabled);
+        assert!(
+            reloaded
+                .accounts
+                .iter()
+                .find(|a| a.name == "bob")
+                .unwrap()
+                .enabled
+        );
 
-        assert!(f.shared.control().reload, "the bot must be told to re-read the file");
+        assert!(
+            f.shared.control().reload,
+            "the bot must be told to re-read the file"
+        );
     }
 
     #[test]
@@ -785,7 +830,13 @@ delay_secs = 20
         assert_eq!(f.request("GET", "/api/config", Some(&viewer), None).0, 200);
         assert_eq!(f.request("GET", "/api/log", Some(&viewer), None).0, 403);
         assert_eq!(
-            f.request("POST", "/api/control", Some(&viewer), Some(r#"{"action":"pause"}"#)).0,
+            f.request(
+                "POST",
+                "/api/control",
+                Some(&viewer),
+                Some(r#"{"action":"pause"}"#)
+            )
+            .0,
             403
         );
 
@@ -793,7 +844,11 @@ delay_secs = 20
             "enabled": true, "settings": crate::config::Settings::default(),
         }))
         .unwrap();
-        assert_eq!(f.request("PUT", "/api/accounts/alice", Some(&viewer), Some(&body)).0, 403);
+        assert_eq!(
+            f.request("PUT", "/api/accounts/alice", Some(&viewer), Some(&body))
+                .0,
+            403
+        );
         assert!(!f.shared.control().paused);
     }
 
@@ -802,14 +857,46 @@ delay_secs = 20
         let f = start("control");
         let admin = f.session("adminuser", WebRole::Admin);
 
-        assert_eq!(f.request("POST", "/api/control", Some(&admin), r#"{"action":"pause"}"#.into()).0, 200);
+        assert_eq!(
+            f.request(
+                "POST",
+                "/api/control",
+                Some(&admin),
+                r#"{"action":"pause"}"#.into()
+            )
+            .0,
+            200
+        );
         assert!(f.shared.control().paused);
-        assert_eq!(f.request("POST", "/api/control", Some(&admin), r#"{"action":"resume"}"#.into()).0, 200);
+        assert_eq!(
+            f.request(
+                "POST",
+                "/api/control",
+                Some(&admin),
+                r#"{"action":"resume"}"#.into()
+            )
+            .0,
+            200
+        );
         assert!(!f.shared.control().paused);
-        assert_eq!(f.request("POST", "/api/control", Some(&admin), r#"{"action":"run_now"}"#.into()).0, 200);
+        assert_eq!(
+            f.request(
+                "POST",
+                "/api/control",
+                Some(&admin),
+                r#"{"action":"run_now"}"#.into()
+            )
+            .0,
+            200
+        );
         assert!(f.shared.control().run_now);
 
-        let (status, body) = f.request("POST", "/api/control", Some(&admin), r#"{"action":"explode"}"#.into());
+        let (status, body) = f.request(
+            "POST",
+            "/api/control",
+            Some(&admin),
+            r#"{"action":"explode"}"#.into(),
+        );
         assert_eq!(status, 400, "{body}");
     }
 
@@ -820,25 +907,43 @@ delay_secs = 20
         let f = start("csrf");
         let admin = f.session("adminuser", WebRole::Admin);
 
-        let (status, body) =
-            f.request_raw("POST", "/api/control", Some(&admin), Some(r#"{"action":"pause"}"#), false);
+        let (status, body) = f.request_raw(
+            "POST",
+            "/api/control",
+            Some(&admin),
+            Some(r#"{"action":"pause"}"#),
+            false,
+        );
         assert_eq!(status, 403, "{body}");
-        assert!(!f.shared.control().paused, "a header-less request must not act");
+        assert!(
+            !f.shared.control().paused,
+            "a header-less request must not act"
+        );
 
         let settings = serde_json::to_string(&json!({
             "enabled": false, "settings": crate::config::Settings::default(),
         }))
         .unwrap();
         let before = std::fs::read_to_string(&f.config_path).unwrap();
-        let (status, _) =
-            f.request_raw("PUT", "/api/accounts/alice", Some(&admin), Some(&settings), false);
+        let (status, _) = f.request_raw(
+            "PUT",
+            "/api/accounts/alice",
+            Some(&admin),
+            Some(&settings),
+            false,
+        );
         assert_eq!(status, 403);
         assert_eq!(std::fs::read_to_string(&f.config_path).unwrap(), before);
 
         // The very same request with the header does act, so the assertions above are
         // about the header and not about something else refusing.
-        let (status, body) =
-            f.request_raw("POST", "/api/control", Some(&admin), Some(r#"{"action":"pause"}"#), true);
+        let (status, body) = f.request_raw(
+            "POST",
+            "/api/control",
+            Some(&admin),
+            Some(r#"{"action":"pause"}"#),
+            true,
+        );
         assert_eq!(status, 200, "{body}");
         assert!(f.shared.control().paused);
     }
@@ -853,9 +958,20 @@ delay_secs = 20
         .unwrap();
 
         let before = std::fs::read_to_string(&f.config_path).unwrap();
-        for name in ["..", "%2e%2e", "Alice", "ab", "a-very-long-account-name", "al/ice"] {
-            let (status, body) =
-                f.request("PUT", &format!("/api/accounts/{name}"), Some(&admin), Some(&settings));
+        for name in [
+            "..",
+            "%2e%2e",
+            "Alice",
+            "ab",
+            "a-very-long-account-name",
+            "al/ice",
+        ] {
+            let (status, body) = f.request(
+                "PUT",
+                &format!("/api/accounts/{name}"),
+                Some(&admin),
+                Some(&settings),
+            );
             // Some of these never reach the handler at all -- an HTTP client
             // normalises `..` out of a path -- so what is asserted is that the request
             // is refused and nothing is written, not which code says so.
@@ -879,7 +995,10 @@ delay_secs = 20
     #[test]
     fn an_expired_or_forged_token_is_no_session_at_all() {
         let f = start("token");
-        assert_eq!(f.request("GET", "/api/status", Some("deadbeef"), None).0, 401);
+        assert_eq!(
+            f.request("GET", "/api/status", Some("deadbeef"), None).0,
+            401
+        );
         assert_eq!(f.request("GET", "/api/status", None, None).0, 401);
 
         let admin = f.session("adminuser", WebRole::Admin);

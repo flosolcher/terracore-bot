@@ -100,6 +100,27 @@ pub struct Control {
     pub reload: bool,
 }
 
+impl Control {
+    /// Take a pending "run now", if the bot is in a position to act on it.
+    ///
+    /// While paused nothing is taken. The rule lives here rather than in the daemon
+    /// loop because getting it wrong is silent: the loop used to consume the flag
+    /// while paused and then not run anything, so the request vanished with no
+    /// cycle and no complaint. Left set, it fires on resume.
+    pub fn take_run_now(&mut self) -> bool {
+        if self.paused {
+            return false;
+        }
+        std::mem::take(&mut self.run_now)
+    }
+
+    /// Take a pending config reload. Unlike "run now" this applies whatever the bot
+    /// is doing -- a paused bot should still pick up an edit before it resumes.
+    pub fn take_reload(&mut self) -> bool {
+        std::mem::take(&mut self.reload)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LogLine {
     pub at: u64,
@@ -188,6 +209,33 @@ mod tests {
         assert_eq!(tail.len(), 3);
         assert_eq!(tail[0].text, "line 7");
         assert_eq!(tail[2].text, "line 9");
+    }
+
+    #[test]
+    fn a_run_now_request_survives_being_paused() {
+        let mut control = Control {
+            paused: true,
+            run_now: true,
+            ..Default::default()
+        };
+        assert!(!control.take_run_now(), "a paused bot starts no cycle");
+        assert!(control.run_now, "and the request must not be thrown away");
+
+        control.paused = false;
+        assert!(control.take_run_now(), "it fires once resumed");
+        assert!(!control.run_now, "and only once");
+        assert!(!control.take_run_now());
+    }
+
+    #[test]
+    fn a_reload_applies_even_while_paused() {
+        let mut control = Control {
+            paused: true,
+            reload: true,
+            ..Default::default()
+        };
+        assert!(control.take_reload());
+        assert!(!control.take_reload());
     }
 
     #[test]

@@ -323,7 +323,11 @@ impl Api {
         }
     }
 
-    fn get<T: serde::de::DeserializeOwned>(&self, path: &str, query: &[(&str, String)]) -> Result<T> {
+    fn get<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<T> {
         let url = format!("{}{}", self.base, path);
         let mut last: Option<anyhow::Error> = None;
         // `retries` is the number of *extra* attempts, matching the website's client.
@@ -365,12 +369,15 @@ impl Api {
     ///
     /// With a focus charge held the client asks `/battle_focus` instead, which is not
     /// capped by defense at all -- a focus charge buys an attack on anyone.
-    pub fn battles(&self, max_defense: f64, limit: u32, offset: u32, focus: bool) -> Result<Vec<Target>> {
+    pub fn battles(
+        &self,
+        max_defense: f64,
+        limit: u32,
+        offset: u32,
+        focus: bool,
+    ) -> Result<Vec<Target>> {
         let path = if focus { "/battle_focus" } else { "/battle" };
-        let mut query = vec![
-            ("limit", limit.to_string()),
-            ("offset", offset.to_string()),
-        ];
+        let mut query = vec![("limit", limit.to_string()), ("offset", offset.to_string())];
         // The website omits the parameter entirely when it would be zero.
         if max_defense != 0.0 {
             query.push(("maxDefense", format_number(max_defense)));
@@ -462,7 +469,10 @@ mod tests {
         // used to carry their own copy of `stake + 1`.
         assert_eq!(p.stash_capacity(), 51.0);
         assert!(p.stash_is_full());
-        let not_quite = Player { scrap: 50.999, ..p.clone() };
+        let not_quite = Player {
+            scrap: 50.999,
+            ..p.clone()
+        };
         assert!(!not_quite.stash_is_full());
         assert_eq!(not_quite.stash_capacity(), 51.0);
     }

@@ -121,7 +121,11 @@ impl Auth {
     ///
     /// Split out from [`Self::login`] so the half that needs no node can be tested
     /// without one -- and so it is obvious that this half proves nothing on its own.
-    fn recover_signer(&self, message: &str, signature_hex: &str) -> Result<(String, hivecomb::PublicKey)> {
+    fn recover_signer(
+        &self,
+        message: &str,
+        signature_hex: &str,
+    ) -> Result<(String, hivecomb::PublicKey)> {
         let challenge = {
             let mut challenges = self.lock_challenges();
             // Taken, not read: a challenge is single use, so a replay of the same
@@ -323,7 +327,10 @@ mod tests {
         let key = PrivateKey::from_wif(THROWAWAY).unwrap();
         let forged = "terracore-bot login as @alice at 0 [deadbeef]";
         let signature = sign_message(forged.as_bytes(), &key).unwrap().to_hex();
-        let err = auth.recover_signer(forged, &signature).unwrap_err().to_string();
+        let err = auth
+            .recover_signer(forged, &signature)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("unknown or already used"), "{err}");
     }
 
@@ -331,7 +338,10 @@ mod tests {
     fn a_signature_that_is_not_a_signature_is_refused() {
         let auth = auth();
         let message = auth.challenge("alice").unwrap();
-        let err = auth.recover_signer(&message, "not-hex").unwrap_err().to_string();
+        let err = auth
+            .recover_signer(&message, "not-hex")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not a signature"), "{err}");
     }
 
@@ -464,7 +474,11 @@ mod tests {
             .to_string();
         assert!(err.contains("weight 1 of the 2"), "{err}");
         // Both keys together would satisfy it; a login presents only one.
-        assert!(authority.check(&[key_of(THROWAWAY), key_of(OTHER)]).satisfied);
+        assert!(
+            authority
+                .check(&[key_of(THROWAWAY), key_of(OTHER)])
+                .satisfied
+        );
     }
 
     #[test]

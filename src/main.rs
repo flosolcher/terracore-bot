@@ -186,7 +186,11 @@ fn check(cli: &Cli) -> Result<()> {
         "cycle    every {}s, {}s between accounts{}",
         config.general.cycle_interval_secs,
         config.general.account_delay_secs,
-        if config.general.dry_run { ", DRY RUN" } else { "" }
+        if config.general.dry_run {
+            ", DRY RUN"
+        } else {
+            ""
+        }
     );
     println!();
     for account in &config.accounts {
@@ -229,7 +233,11 @@ fn wallet(command: &WalletCommand, cli: &Cli) -> Result<()> {
         }
         WalletCommand::Import(args) => {
             let public = keys::import(&path, &passphrase_env, &args.account, args.role.into())?;
-            println!("stored {public} for @{} ({:?})", args.account, Role::from(args.role).as_str());
+            println!(
+                "stored {public} for @{} ({:?})",
+                args.account,
+                Role::from(args.role).as_str()
+            );
         }
         WalletCommand::List => {
             let index = keys::list(&path)?;

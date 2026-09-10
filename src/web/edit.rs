@@ -254,7 +254,9 @@ max_enemy_dodge = 25.0   # alice is picky
     #[test]
     fn an_unknown_account_is_refused_rather_than_created() {
         let settings = settings_of(FILE, "alice");
-        let err = apply(FILE, "mallory", &settings, true).unwrap_err().to_string();
+        let err = apply(FILE, "mallory", &settings, true)
+            .unwrap_err()
+            .to_string();
         // Named precisely. `contains("mallory")` also matched the error raised further
         // down when the write itself failed, so deleting the guard left this test
         // green -- which mutation testing caught.

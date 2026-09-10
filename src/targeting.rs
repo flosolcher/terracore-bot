@@ -207,7 +207,10 @@ mod tests {
     #[test]
     fn a_reachable_target_is_accepted() {
         let (s, b) = (settings(), HashSet::new());
-        assert_eq!(reject(&target("bob", 100.0, 400.0, 10.0), &ctx(&s, &b)), None);
+        assert_eq!(
+            reject(&target("bob", 100.0, 400.0, 10.0), &ctx(&s, &b)),
+            None
+        );
     }
 
     #[test]
@@ -218,7 +221,10 @@ mod tests {
             reject(&target("bob", 100.0, 500.0, 0.0), &ctx(&s, &b)),
             Some(Rejection::OutOfReach)
         );
-        assert_eq!(reject(&target("bob", 100.0, 499.0, 0.0), &ctx(&s, &b)), None);
+        assert_eq!(
+            reject(&target("bob", 100.0, 499.0, 0.0), &ctx(&s, &b)),
+            None
+        );
     }
 
     #[test]
@@ -230,7 +236,10 @@ mod tests {
             reject(&target("bob", 100.0, 470.0, 0.0), &ctx(&s, &b)),
             Some(Rejection::OutOfReach)
         );
-        assert_eq!(reject(&target("bob", 100.0, 440.0, 0.0), &ctx(&s, &b)), None);
+        assert_eq!(
+            reject(&target("bob", 100.0, 440.0, 0.0), &ctx(&s, &b)),
+            None
+        );
     }
 
     #[test]
@@ -256,7 +265,10 @@ mod tests {
 
         let mut fresh = target("bob", 100.0, 100.0, 0.0);
         fresh.last_battle = NOW - 59_000;
-        assert_eq!(reject(&fresh, &ctx(&s, &b)), Some(Rejection::RecentlyBattled));
+        assert_eq!(
+            reject(&fresh, &ctx(&s, &b)),
+            Some(Rejection::RecentlyBattled)
+        );
         fresh.last_battle = NOW - 61_000;
         assert_eq!(reject(&fresh, &ctx(&s, &b)), None);
 

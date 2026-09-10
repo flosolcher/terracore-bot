@@ -48,12 +48,15 @@ impl KeyStore {
     /// The keys for one account, or an error naming what is missing. A posting key is
     /// the minimum: without it the account cannot do anything at all.
     pub fn for_account(&self, account: &str) -> Result<AccountKeys> {
-        let posting = self.wallet.key_for_role(account, Role::Posting).map_err(|_| {
-            anyhow::anyhow!(
-                "no posting key for `{account}` in the wallet -- add one with \
+        let posting = self
+            .wallet
+            .key_for_role(account, Role::Posting)
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "no posting key for `{account}` in the wallet -- add one with \
                  `terracore-bot wallet import --account {account} --role posting`"
-            )
-        })?;
+                )
+            })?;
         // Absent is the normal case and not an error: it means "this account does not
         // do the things that spend tokens".
         let active = self.wallet.key_for_role(account, Role::Active).ok();
@@ -87,8 +90,11 @@ pub fn import(path: &Path, passphrase_env: &str, account: &str, role: Role) -> R
     // Wiped on drop. hivecomb's `PrivateKey` zeroizes its own copy; this is the
     // copy that would otherwise be left behind in a freed allocation.
     let wif = Zeroizing::new(if std::io::stdin().is_terminal() {
-        rpassword::prompt_password(format!("{role_str} WIF for @{account}: ", role_str = role.as_str()))
-            .context("reading the key")?
+        rpassword::prompt_password(format!(
+            "{role_str} WIF for @{account}: ",
+            role_str = role.as_str()
+        ))
+        .context("reading the key")?
     } else {
         let mut line = String::new();
         std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)
@@ -102,14 +108,17 @@ pub fn import(path: &Path, passphrase_env: &str, account: &str, role: Role) -> R
     // replaces its account/role tag rather than storing a second entry. Silently
     // losing the earlier tag is how an account ends up with an active key and no
     // posting key, so say it out loud.
-    let already = wallet.index().into_iter().find(|(existing_account, roles)| {
-        (existing_account != account || !roles.iter().any(|r| r == role.as_str()))
-            && wallet
-                .key_for_role(existing_account, Role::Posting)
-                .or_else(|_| wallet.key_for_role(existing_account, Role::Active))
-                .map(|k| k.public_key() == key.public_key())
-                .unwrap_or(false)
-    });
+    let already = wallet
+        .index()
+        .into_iter()
+        .find(|(existing_account, roles)| {
+            (existing_account != account || !roles.iter().any(|r| r == role.as_str()))
+                && wallet
+                    .key_for_role(existing_account, Role::Posting)
+                    .or_else(|_| wallet.key_for_role(existing_account, Role::Active))
+                    .map(|k| k.public_key() == key.public_key())
+                    .unwrap_or(false)
+        });
     if let Some((existing_account, roles)) = already {
         eprintln!(
             "warning: this key is already stored for @{existing_account} ({}); that tag \
@@ -157,9 +166,8 @@ fn read_passphrase(env_var: &str, prompt: &str, confirm: bool) -> Result<Zeroizi
              unattended runs"
         );
     }
-    let passphrase = Zeroizing::new(
-        rpassword::prompt_password(prompt).context("reading the passphrase")?,
-    );
+    let passphrase =
+        Zeroizing::new(rpassword::prompt_password(prompt).context("reading the passphrase")?);
     if confirm {
         let again = Zeroizing::new(
             rpassword::prompt_password("Repeat: ").context("reading the passphrase")?,

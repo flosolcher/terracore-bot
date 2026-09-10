@@ -188,7 +188,9 @@ impl Runner<'_> {
             // The website refuses to attack with no claims left, and so does the game.
             if player.claims < 1.0 {
                 if done == 0 {
-                    return Ok(Outcome::skipped("no claims left; the game blocks attacking"));
+                    return Ok(Outcome::skipped(
+                        "no claims left; the game blocks attacking",
+                    ));
                 }
                 break;
             }
@@ -206,7 +208,10 @@ impl Runner<'_> {
                 break;
             }
             if done >= budget {
-                debug!(account = self.account, budget, "the cycle's attack budget is spent");
+                debug!(
+                    account = self.account,
+                    budget, "the cycle's attack budget is spent"
+                );
                 break;
             }
 
@@ -222,7 +227,12 @@ impl Runner<'_> {
             if board.is_empty() && !board_is_fresh {
                 board = self
                     .api
-                    .battles(player.stats.damage, s.candidate_limit, 1, ctx.focus_active())
+                    .battles(
+                        player.stats.damage,
+                        s.candidate_limit,
+                        1,
+                        ctx.focus_active(),
+                    )
                     .context("fetching the battle board")?;
                 board_is_fresh = true;
             }
@@ -307,10 +317,7 @@ impl Runner<'_> {
             return Ok(Outcome::skipped("quest collection is disabled"));
         }
 
-        let quests: Vec<Quest> = self
-            .api
-            .quests(self.account)
-            .context("fetching missions")?;
+        let quests: Vec<Quest> = self.api.quests(self.account).context("fetching missions")?;
         let now = now_ms();
         let ready: Vec<&Quest> = quests.iter().filter(|q| q.collectable(now)).collect();
 
@@ -366,10 +373,7 @@ impl Runner<'_> {
             Err(outcome) => return Ok(outcome),
         };
 
-        let planets = self
-            .api
-            .planets(self.account)
-            .context("fetching planets")?;
+        let planets = self.api.planets(self.account).context("fetching planets")?;
         if !planets.username.eq_ignore_ascii_case(self.account) {
             return Ok(Outcome::skipped(format!(
                 "the planets endpoint answered for `{}` rather than `{}`",
@@ -385,22 +389,34 @@ impl Runner<'_> {
             .boss_data
             .iter()
             .filter(|p| {
-                if !s.planets.is_empty() && !s.planets.iter().any(|n| n.eq_ignore_ascii_case(&p.name)) {
+                if !s.planets.is_empty()
+                    && !s.planets.iter().any(|n| n.eq_ignore_ascii_case(&p.name))
+                {
                     return false;
                 }
-                if s.skip_planets.iter().any(|n| n.eq_ignore_ascii_case(&p.name)) {
+                if s.skip_planets
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(&p.name))
+                {
                     return false;
                 }
-                planets.level >= p.level && p.ready(now) && p.flux > 0.0 && p.flux <= s.max_flux_per_fight
+                planets.level >= p.level
+                    && p.ready(now)
+                    && p.flux > 0.0
+                    && p.flux <= s.max_flux_per_fight
             })
             .collect();
 
         match s.order {
             BossOrder::HighestLevel => eligible.sort_by(|a, b| {
-                b.level.partial_cmp(&a.level).unwrap_or(std::cmp::Ordering::Equal)
+                b.level
+                    .partial_cmp(&a.level)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             }),
             BossOrder::Cheapest => eligible.sort_by(|a, b| {
-                a.flux.partial_cmp(&b.flux).unwrap_or(std::cmp::Ordering::Equal)
+                a.flux
+                    .partial_cmp(&b.flux)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             }),
             BossOrder::Listed => eligible.sort_by_key(|p| {
                 s.planets
@@ -533,8 +549,11 @@ impl Runner<'_> {
                     }
                     let cost = upgrade_cost(stat, current(stat));
                     if s.max_cost > 0.0 && cost > s.max_cost {
-                        last_reason =
-                            format!("the next {} costs {:.0}, above max_cost", stat.as_str(), cost);
+                        last_reason = format!(
+                            "the next {} costs {:.0}, above max_cost",
+                            stat.as_str(),
+                            cost
+                        );
                         return None;
                     }
                     if balance - cost < s.min_scrap_reserve {
@@ -551,7 +570,8 @@ impl Runner<'_> {
                 .collect();
 
             if s.order == UpgradeOrder::Cheapest {
-                affordable.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                affordable
+                    .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             }
 
             let Some(&(stat, cost)) = affordable.first() else {
@@ -661,7 +681,10 @@ mod tests {
         let boss = runner.boss_fights().unwrap();
         assert_eq!(boss.performed, 0);
         assert!(
-            boss.skipped_reason.as_deref().unwrap_or_default().contains("active key"),
+            boss.skipped_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("active key"),
             "{:?}",
             boss.skipped_reason
         );
@@ -669,7 +692,11 @@ mod tests {
         let upgrade = runner.upgrades(&Player::default()).unwrap();
         assert_eq!(upgrade.performed, 0);
         assert!(
-            upgrade.skipped_reason.as_deref().unwrap_or_default().contains("active key"),
+            upgrade
+                .skipped_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("active key"),
             "{:?}",
             upgrade.skipped_reason
         );
@@ -700,13 +727,157 @@ mod tests {
         assert!(reason.contains("min_scrap_reserve"), "{reason}");
     }
 
+    /// The three guards that stop an attack run before it starts. Each is checked
+    /// before the battle board is fetched, so all of this runs with no network -- a
+    /// test that started reaching one would fail rather than quietly pass.
+    #[test]
+    fn an_attack_run_refuses_for_the_right_reason_and_says_which() {
+        let settings = Settings::default();
+        let (api, hive, keys) = parts(None);
+        let blacklist = HashSet::new();
+        let runner = runner!(api, hive, keys, settings, blacklist);
+
+        let healthy = Player {
+            attacks: 5.0,
+            claims: 3.0,
+            scrap: 0.0,
+            hive_engine_stake: 1000.0,
+            ..Default::default()
+        };
+
+        // No attacks left.
+        let out = runner
+            .attack(&Player {
+                attacks: 0.0,
+                ..healthy.clone()
+            })
+            .unwrap();
+        assert_eq!(out.performed, 0);
+        assert!(
+            out.skipped_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("below min_attacks"),
+            "{:?}",
+            out.skipped_reason
+        );
+
+        // Attacks in hand but no claims: the game refuses the battle, so spending one
+        // would simply throw it away.
+        let out = runner
+            .attack(&Player {
+                claims: 0.0,
+                ..healthy.clone()
+            })
+            .unwrap();
+        assert_eq!(out.performed, 0);
+        assert!(
+            out.skipped_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no claims left"),
+            "{:?}",
+            out.skipped_reason
+        );
+
+        // Stash at the ceiling: looted scrap would have nowhere to land.
+        let out = runner
+            .attack(&Player {
+                scrap: 1001.0,
+                ..healthy.clone()
+            })
+            .unwrap();
+        assert_eq!(out.performed, 0);
+        assert!(
+            out.skipped_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("stash full"),
+            "{:?}",
+            out.skipped_reason
+        );
+
+        // And disabled outright.
+        let mut off = Settings::default();
+        off.attack.enabled = false;
+        let (api2, hive2, keys2) = parts(None);
+        let runner = runner!(api2, hive2, keys2, off, blacklist);
+        assert!(runner
+            .attack(&healthy)
+            .unwrap()
+            .skipped_reason
+            .unwrap_or_default()
+            .contains("disabled"));
+    }
+
+    /// Claiming has its own guards, and the same property: every refusal happens
+    /// before anything is signed or sent.
+    #[test]
+    fn claiming_refuses_for_the_right_reason_and_says_which() {
+        let settings = Settings::default();
+        let (api, hive, keys) = parts(None);
+        let blacklist = HashSet::new();
+        let runner = runner!(api, hive, keys, settings, blacklist);
+
+        let out = runner
+            .claim(&Player {
+                claims: 0.0,
+                scrap: 100.0,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            out.skipped_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("below min_claims"),
+            "{:?}",
+            out.skipped_reason
+        );
+
+        let out = runner
+            .claim(&Player {
+                claims: 4.0,
+                scrap: 0.0,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            out.skipped_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("below min_scrap"),
+            "{:?}",
+            out.skipped_reason
+        );
+
+        let mut off = Settings::default();
+        off.claim.enabled = false;
+        let (api2, hive2, keys2) = parts(None);
+        let runner = runner!(api2, hive2, keys2, off, blacklist);
+        assert!(runner
+            .claim(&Player {
+                claims: 4.0,
+                scrap: 100.0,
+                ..Default::default()
+            })
+            .unwrap()
+            .skipped_reason
+            .unwrap_or_default()
+            .contains("disabled"));
+    }
+
     #[test]
     fn a_disabled_action_says_so_rather_than_blaming_the_key() {
         let settings = Settings::default();
         let (api, hive, keys) = parts(None);
         let blacklist = HashSet::new();
         let runner = runner!(api, hive, keys, settings, blacklist);
-        let reason = runner.boss_fights().unwrap().skipped_reason.unwrap_or_default();
+        let reason = runner
+            .boss_fights()
+            .unwrap()
+            .skipped_reason
+            .unwrap_or_default();
         assert!(reason.contains("disabled"), "{reason}");
     }
 

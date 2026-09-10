@@ -129,7 +129,10 @@ impl Broadcaster {
         let signed = transaction
             .sign(std::slice::from_ref(key), Chain::Hive)
             .context("signing the transaction")?;
-        let trx_id = signed.transaction.id().context("computing the transaction id")?;
+        let trx_id = signed
+            .transaction
+            .id()
+            .context("computing the transaction id")?;
 
         if self.dry_run {
             let envelope = signed.to_json().context("rendering the transaction")?;
@@ -230,7 +233,10 @@ mod tests {
 
     #[test]
     fn a_payload_that_names_an_action_carries_its_own_nonce() {
-        let out = add_tx_hash("terracore_equip", json!({ "action": "terracore_equip-abc" }));
+        let out = add_tx_hash(
+            "terracore_equip",
+            json!({ "action": "terracore_equip-abc" }),
+        );
         assert!(out.get("tx-hash").is_none());
     }
 
@@ -246,7 +252,12 @@ mod tests {
     }
 
     fn built(auth: Auth) -> CustomJson {
-        match custom_json_operation("alice", auth, "terracore_battle", json!({ "target": "bob" })) {
+        match custom_json_operation(
+            "alice",
+            auth,
+            "terracore_battle",
+            json!({ "target": "bob" }),
+        ) {
             Operation::CustomJson(op) => op,
             other => panic!("expected a custom_json, got {other:?}"),
         }
