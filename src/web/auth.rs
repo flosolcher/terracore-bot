@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use hivecomb::rpc::{NodeClient, UreqTransport};
 use hivecomb::sign::{recover_message, Signature};
+use hivecomb::{Authority, PublicKey};
 use rand::RngCore;
 
 use crate::config::WebRole;
@@ -152,26 +153,7 @@ impl Auth {
             .with_context(|| format!("looking up @{} on Hive", account_name))?
             .ok_or_else(|| anyhow::anyhow!("@{} does not exist on Hive", account_name))?;
 
-        let check = account.posting.check(&[key]);
-        if !check.satisfied {
-            if !check.unresolved_accounts.is_empty() {
-                // Being explicit beats a bare "denied": the person may well hold the
-                // authority, just not through a key this check can see.
-                bail!(
-                    "that key does not meet @{}'s posting threshold on its own \
-                     (weight {} of {}), and the rest is delegated to another account, \
-                     which a login cannot follow. Sign with a key held directly in the \
-                     posting authority.",
-                    account_name,
-                    check.weight,
-                    check.threshold
-                );
-            }
-            bail!(
-                "that key is not in @{}'s posting authority",
-                account_name
-            );
-        }
+        authorize(&account_name, &account.posting, &key)?;
 
         let role = self
             .role_of(&account_name)
@@ -232,6 +214,36 @@ impl Auth {
     fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, Session>> {
         self.sessions.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
+
+/// Whether `key` may act for `account`, given the posting authority the chain reports.
+///
+/// Split out from [`Auth::login`] deliberately: this is the check the whole panel
+/// rests on, and inside `login` it could only be exercised with a live node -- which
+/// means a default `cargo test` would not exercise it at all. Mutation testing found
+/// exactly that: deleting the check left the offline suite green.
+fn authorize(account: &str, authority: &Authority, key: &PublicKey) -> Result<()> {
+    let check = authority.check(std::slice::from_ref(key));
+    if check.satisfied {
+        return Ok(());
+    }
+
+    // `satisfied == false` with delegations outstanding means "not from keys alone",
+    // not "no" -- so say which of the two it is rather than a bare refusal.
+    let delegated = if check.unresolved_accounts.is_empty() {
+        ""
+    } else {
+        ", and the rest of the authority is delegated to another account, which a login cannot follow"
+    };
+
+    if check.matched_keys.is_empty() {
+        bail!("that key is not in @{account}'s posting authority{delegated}");
+    }
+    bail!(
+        "that key carries weight {} of the {} @{account}'s posting authority needs{delegated}",
+        check.weight,
+        check.threshold
+    );
 }
 
 /// Cryptographically random hex. `rand::thread_rng` is seeded from the OS and
@@ -359,6 +371,109 @@ mod tests {
     #[test]
     fn an_unknown_token_names_no_session() {
         assert!(auth().session("deadbeef").is_none());
+    }
+
+    fn auth_with_ttl(seconds: u64) -> Auth {
+        let mut access = BTreeMap::new();
+        access.insert("alice".to_string(), WebRole::Admin);
+        Auth::new(
+            vec!["https://api.hive.blog".into()],
+            Duration::from_secs(5),
+            Duration::from_secs(seconds),
+            access,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_session_stops_working_once_it_expires() {
+        // Zero TTL: expired the instant it exists.
+        let expiring = auth_with_ttl(0);
+        let token = expiring.mint_session("alice", WebRole::Admin);
+        assert!(
+            expiring.session(&token).is_none(),
+            "an expired session must not authenticate anything"
+        );
+
+        // The same call with a real TTL does work, so the assertion above is about
+        // expiry and not about `mint_session` being broken.
+        let live = auth_with_ttl(3600);
+        let token = live.mint_session("alice", WebRole::Admin);
+        assert!(live.session(&token).is_some());
+    }
+
+    #[test]
+    fn logging_out_ends_the_session_immediately() {
+        let auth = auth_with_ttl(3600);
+        let token = auth.mint_session("alice", WebRole::Admin);
+        assert!(auth.session(&token).is_some());
+        auth.logout(&token);
+        assert!(auth.session(&token).is_none());
+    }
+
+    // --- the authority check, without a node --------------------------------
+
+    /// A second published, valueless key, so two distinct keys are available.
+    const OTHER: &str = "5HqAsN8eAPtwrsLp4kKuKDfrCCT8pTcE5e7znamgZ559usgDtWE";
+
+    fn key_of(wif: &str) -> PublicKey {
+        PrivateKey::from_wif(wif).unwrap().public_key()
+    }
+
+    fn authority(threshold: u32, keys: &[(&str, u16)], delegated: &[(&str, u16)]) -> Authority {
+        Authority::new(
+            threshold,
+            delegated
+                .iter()
+                .map(|(a, w)| hivecomb::authority::AccountAuth {
+                    account: (*a).to_string(),
+                    weight: *w,
+                })
+                .collect(),
+            keys.iter()
+                .map(|(wif, w)| hivecomb::authority::KeyAuth {
+                    key: key_of(wif),
+                    weight: *w,
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_key_in_the_authority_with_enough_weight_is_authorized() {
+        let authority = authority(1, &[(THROWAWAY, 1)], &[]);
+        assert!(authorize("alice", &authority, &key_of(THROWAWAY)).is_ok());
+    }
+
+    #[test]
+    fn a_key_that_is_not_in_the_authority_is_refused() {
+        let authority = authority(1, &[(THROWAWAY, 1)], &[]);
+        let err = authorize("alice", &authority, &key_of(OTHER))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not in @alice's posting authority"), "{err}");
+    }
+
+    #[test]
+    fn a_key_that_is_in_the_authority_but_underweight_is_refused_and_says_so() {
+        // Present, but carrying 1 of the 2 the account requires.
+        let authority = authority(2, &[(THROWAWAY, 1), (OTHER, 1)], &[]);
+        let err = authorize("alice", &authority, &key_of(THROWAWAY))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("weight 1 of the 2"), "{err}");
+        // Both keys together would satisfy it; a login presents only one.
+        assert!(authority.check(&[key_of(THROWAWAY), key_of(OTHER)]).satisfied);
+    }
+
+    #[test]
+    fn an_authority_that_leans_on_a_delegation_says_that_rather_than_just_no() {
+        let authority = authority(2, &[(THROWAWAY, 1)], &[("peakd", 1)]);
+        let err = authorize("alice", &authority, &key_of(THROWAWAY))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("delegated"), "{err}");
     }
 
     #[test]

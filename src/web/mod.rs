@@ -42,7 +42,6 @@ struct Panel {
     wallet_path: PathBuf,
     shared: Arc<Shared>,
     auth: Auth,
-    allow_key_import: bool,
 }
 
 /// A running panel. Production only needs to know it started; the tests need to
@@ -89,7 +88,6 @@ pub fn spawn(config: &Config, shared: Arc<Shared>) -> Result<Running> {
         wallet_path: config.wallet_path(),
         shared,
         auth,
-        allow_key_import: config.web.allow_key_import,
     });
 
     let server = tiny_http::Server::http(address)
@@ -217,7 +215,6 @@ impl Panel {
                     "account": session.account,
                     "role": session.role.as_str(),
                     "expires_at": session.expires_at,
-                    "allow_key_import": self.allow_key_import,
                 })))
             }
 
@@ -349,9 +346,17 @@ impl Panel {
                 let Some(session) = self.session(request) else {
                     return Ok(unauthorized());
                 };
-                let name = path.trim_start_matches("/api/accounts/").to_string();
-                if name.is_empty() || name.contains('/') {
-                    return Ok(error(StatusCode(400), &anyhow::anyhow!("bad account name")));
+                // `strip_prefix`, not `trim_start_matches`: the latter strips the
+                // pattern repeatedly, so `/api/accounts//api/accounts/alice` would
+                // have resolved to `alice`.
+                let name = path.strip_prefix("/api/accounts/").unwrap_or_default().to_string();
+                // Nothing downstream decodes percent-escapes, so the name has to be
+                // one that never needs them. Hive account names never do.
+                if !is_hive_account_name(&name) {
+                    return Ok(error(
+                        StatusCode(400),
+                        &anyhow::anyhow!("`{name}` is not a Hive account name"),
+                    ));
                 }
                 if !session.role.may_write(&session.account, &name) {
                     return Ok(forbidden(&format!(
@@ -462,10 +467,27 @@ fn cookie(request: &Request, name: &str) -> Option<String> {
         .value
         .as_str()
         .to_string();
+    cookie_value(&header, name)
+}
+
+/// Pull one cookie out of a `Cookie:` header.
+///
+/// Separate from [`cookie`] so a test can call the parser rather than restate it.
+/// The previous test held its own copy of these three lines, which meant it would
+/// have passed however the real one behaved.
+fn cookie_value(header: &str, name: &str) -> Option<String> {
     header.split(';').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
         (k.trim() == name).then(|| v.trim().to_string())
     })
+}
+
+/// Hive account names: 3-16 characters of lowercase letters, digits, `.` and `-`.
+fn is_hive_account_name(name: &str) -> bool {
+    (3..=16).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-')
 }
 
 fn session_cookie(token: &str, clear: bool) -> Header {
@@ -531,14 +553,24 @@ mod tests {
 
     #[test]
     fn a_cookie_header_yields_the_named_value() {
-        // `cookie()` needs a Request, which tiny_http will not build outside a
-        // connection, so the parsing itself is what is checked here.
         let header = "other=1; tc_session=abc123; another=2";
-        let found = header.split(';').find_map(|pair| {
-            let (k, v) = pair.split_once('=')?;
-            (k.trim() == SESSION_COOKIE).then(|| v.trim().to_string())
-        });
-        assert_eq!(found.as_deref(), Some("abc123"));
+        assert_eq!(cookie_value(header, SESSION_COOKIE).as_deref(), Some("abc123"));
+        assert_eq!(cookie_value(header, "nothing-here"), None);
+        assert_eq!(cookie_value("", SESSION_COOKIE), None);
+        // A prefix of the name is not the name.
+        assert_eq!(cookie_value("tc_sessionx=abc", SESSION_COOKIE), None);
+    }
+
+    #[test]
+    fn only_something_shaped_like_a_hive_account_reaches_the_config_writer() {
+        assert!(is_hive_account_name("alice"));
+        assert!(is_hive_account_name("a-b.c1"));
+        assert!(!is_hive_account_name(""));
+        assert!(!is_hive_account_name("ab"));
+        assert!(!is_hive_account_name("../../etc/passwd"));
+        assert!(!is_hive_account_name("Alice"));
+        assert!(!is_hive_account_name("alice%2e"));
+        assert!(!is_hive_account_name(&"a".repeat(17)));
     }
 
     #[test]
@@ -633,13 +665,28 @@ delay_secs = 20
             token: Option<&str>,
             body: Option<&str>,
         ) -> (u16, String) {
+            self.request_raw(method, path, token, body, true)
+        }
+
+        /// As above, but able to leave off the header the UI always sends -- which is
+        /// what a cross-site request would look like.
+        fn request_raw(
+            &self,
+            method: &str,
+            path: &str,
+            token: Option<&str>,
+            body: Option<&str>,
+            ui_header: bool,
+        ) -> (u16, String) {
             let url = format!("http://{}{path}", self.addr);
             let mut request = match method {
                 "GET" => ureq::get(&url),
                 "PUT" => ureq::put(&url),
                 _ => ureq::post(&url),
+            };
+            if ui_header {
+                request = request.set(CSRF_HEADER, "1");
             }
-            .set(CSRF_HEADER, "1");
             if let Some(token) = token {
                 request = request.set("Cookie", &format!("{SESSION_COOKIE}={token}"));
             }
@@ -757,6 +804,69 @@ delay_secs = 20
 
         let (status, body) = f.request("POST", "/api/control", Some(&admin), r#"{"action":"explode"}"#.into());
         assert_eq!(status, 400, "{body}");
+    }
+
+    #[test]
+    fn a_request_without_the_ui_header_changes_nothing() {
+        // What a form posted from another origin looks like: it may carry the cookie
+        // in a browser that ignores SameSite, but it cannot set a custom header.
+        let f = start("csrf");
+        let admin = f.session("adminuser", WebRole::Admin);
+
+        let (status, body) =
+            f.request_raw("POST", "/api/control", Some(&admin), Some(r#"{"action":"pause"}"#), false);
+        assert_eq!(status, 403, "{body}");
+        assert!(!f.shared.control().paused, "a header-less request must not act");
+
+        let settings = serde_json::to_string(&json!({
+            "enabled": false, "settings": crate::config::Settings::default(),
+        }))
+        .unwrap();
+        let before = std::fs::read_to_string(&f.config_path).unwrap();
+        let (status, _) =
+            f.request_raw("PUT", "/api/accounts/alice", Some(&admin), Some(&settings), false);
+        assert_eq!(status, 403);
+        assert_eq!(std::fs::read_to_string(&f.config_path).unwrap(), before);
+
+        // The very same request with the header does act, so the assertions above are
+        // about the header and not about something else refusing.
+        let (status, body) =
+            f.request_raw("POST", "/api/control", Some(&admin), Some(r#"{"action":"pause"}"#), true);
+        assert_eq!(status, 200, "{body}");
+        assert!(f.shared.control().paused);
+    }
+
+    #[test]
+    fn a_bad_account_name_never_reaches_the_config_writer() {
+        let f = start("names");
+        let admin = f.session("adminuser", WebRole::Admin);
+        let settings = serde_json::to_string(&json!({
+            "enabled": true, "settings": crate::config::Settings::default(),
+        }))
+        .unwrap();
+
+        let before = std::fs::read_to_string(&f.config_path).unwrap();
+        for name in ["..", "%2e%2e", "Alice", "ab", "a-very-long-account-name", "al/ice"] {
+            let (status, body) =
+                f.request("PUT", &format!("/api/accounts/{name}"), Some(&admin), Some(&settings));
+            // Some of these never reach the handler at all -- an HTTP client
+            // normalises `..` out of a path -- so what is asserted is that the request
+            // is refused and nothing is written, not which code says so.
+            assert!(
+                (400..500).contains(&status),
+                "{name} should be refused, got {status} {body}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&f.config_path).unwrap(),
+                before,
+                "{name} must not have written anything"
+            );
+        }
+
+        // A name that is fine still works, so the loop above refuses these names
+        // rather than refusing everything.
+        let (status, body) = f.request("PUT", "/api/accounts/alice", Some(&admin), Some(&settings));
+        assert_eq!(status, 200, "{body}");
     }
 
     #[test]

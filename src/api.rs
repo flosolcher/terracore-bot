@@ -157,11 +157,13 @@ pub struct Player {
 
 impl Player {
     /// The website blocks attacking once the stash is full, because looted scrap
-    /// would have nowhere to land. The ceiling is the staked balance plus one.
+    /// would have nowhere to land.
     pub fn stash_is_full(&self) -> bool {
-        self.scrap >= self.hive_engine_stake + 1.0
+        self.scrap >= self.stash_capacity()
     }
 
+    /// The ceiling: the staked balance plus one. Stated once, so the "is it full"
+    /// test and the number the UI shows cannot drift apart.
     pub fn stash_capacity(&self) -> f64 {
         self.hive_engine_stake + 1.0
     }
@@ -407,18 +409,22 @@ impl Api {
     }
 }
 
-/// Render a float the way JavaScript's `String(x)` would: no trailing `.0`, no
-/// exponent for the magnitudes this game deals in. Amounts sent to Hive-Engine are
-/// compared as text by the contract, so this is not cosmetic.
+/// Render a float the way JavaScript's `String(x)` would. Amounts sent to
+/// Hive-Engine are compared as text by the contract, so this is not cosmetic.
+///
+/// Rust's `Display` for `f64` already prints a whole number with no trailing `.0`
+/// and otherwise picks the shortest representation that round-trips -- the same
+/// choice `String(x)` makes. This used to branch on `value == value.trunc()` and
+/// format through `i64`; mutation testing showed nothing could tell the branch was
+/// gone, because both arms produced identical text for every value it handled.
+///
+/// The one place the two languages part company is around 1e21, where JavaScript
+/// switches to exponent notation and Rust does not. No amount in this game comes
+/// close, so that divergence is noted rather than handled.
 pub fn format_number(value: f64) -> String {
-    if value == value.trunc() && value.abs() < 1e15 {
-        format!("{}", value as i64)
-    } else {
-        // Round to Hive-Engine's eight decimals, then let Rust pick the shortest
-        // representation that round-trips.
-        let rounded = (value * 1e8).round() / 1e8;
-        format!("{rounded}")
-    }
+    // Rounded first, to stay inside Hive-Engine's eight decimals.
+    let rounded = (value * 1e8).round() / 1e8;
+    format!("{rounded}")
 }
 
 #[cfg(test)]
@@ -427,10 +433,38 @@ mod tests {
 
     #[test]
     fn numbers_render_like_the_website_does() {
+        // Whole numbers carry no trailing `.0`, which is what the contract compares.
         assert_eq!(format_number(269361.0), "269361");
-        assert_eq!(format_number(108570.25), "108570.25");
-        assert_eq!(format_number(0.1), "0.1");
         assert_eq!(format_number(2.0), "2");
+        assert_eq!(format_number(0.1), "0.1");
+        // A fractional upgrade price keeps its fraction rather than rounding to an
+        // amount the contract would refuse.
+        assert_eq!(format_number(108570.25), "108570.25");
+        // Never exponent notation and never zero-padded: `{:e}` and `{:.8}` are each
+        // one edit away and both would break the contract.
+        for value in [1e12f64, 1e15, 0.00000001] {
+            let text = format_number(value);
+            assert!(!text.contains('e'), "{value} rendered as {text}");
+        }
+        assert_eq!(format_number(2.5), "2.5");
+        // Beyond eight decimals the amount is rounded, not truncated or expanded.
+        assert_eq!(format_number(1.234567891), "1.23456789");
+    }
+
+    #[test]
+    fn the_stash_ceiling_is_stated_once() {
+        let p = Player {
+            hive_engine_stake: 50.0,
+            scrap: 51.0,
+            ..Default::default()
+        };
+        // Whatever the ceiling is, "full" has to mean "at or above it" -- the two
+        // used to carry their own copy of `stake + 1`.
+        assert_eq!(p.stash_capacity(), 51.0);
+        assert!(p.stash_is_full());
+        let not_quite = Player { scrap: 50.999, ..p.clone() };
+        assert!(!not_quite.stash_is_full());
+        assert_eq!(not_quite.stash_capacity(), 51.0);
     }
 
     #[test]

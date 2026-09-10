@@ -14,8 +14,6 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::config::Settings;
 
-const SECTIONS: [&str; 5] = ["attack", "claim", "quest", "boss", "upgrade"];
-
 /// Apply one account's settings to the config text, returning the new text.
 pub fn apply(text: &str, account: &str, incoming: &Settings, enabled: bool) -> Result<String> {
     let defaults = crate::config::Config::default_settings(text)
@@ -32,7 +30,13 @@ pub fn apply(text: &str, account: &str, incoming: &Settings, enabled: bool) -> R
         bail!("no [accounts.{account}] section in the config");
     }
 
-    for section in SECTIONS {
+    // The sections are whatever `Settings` serializes to, rather than a list kept in
+    // step by hand: a new group of settings would otherwise be shown by the UI,
+    // accepted by the server, and silently never written.
+    let sections: Vec<String> = incoming.keys().cloned().collect();
+
+    for section in &sections {
+        let section = section.as_str();
         let incoming_section = incoming.get(section).and_then(|v| v.as_table());
         let defaults_section = defaults.get(section).and_then(|v| v.as_table());
         let (Some(incoming_section), Some(defaults_section)) = (incoming_section, defaults_section)
@@ -57,7 +61,7 @@ pub fn apply(text: &str, account: &str, incoming: &Settings, enabled: bool) -> R
         set_account_key(&mut doc, account, "enabled", Value::from(false));
     }
 
-    prune_empty_sections(&mut doc, account);
+    prune_empty_sections(&mut doc, account, &sections);
     Ok(doc.to_string())
 }
 
@@ -132,11 +136,12 @@ fn unset_account_key(doc: &mut DocumentMut, account: &str, key: &str) {
 
 /// Drop `[accounts.x.attack]` once its last override is gone, so the file does not
 /// accumulate empty headings.
-fn prune_empty_sections(doc: &mut DocumentMut, account: &str) {
+fn prune_empty_sections(doc: &mut DocumentMut, account: &str, sections: &[String]) {
     let Some(table) = account_table(doc, account) else {
         return;
     };
-    for section in SECTIONS {
+    for section in sections {
+        let section = section.as_str();
         let empty = table
             .get(section)
             .and_then(Item::as_table)
@@ -250,7 +255,42 @@ max_enemy_dodge = 25.0   # alice is picky
     fn an_unknown_account_is_refused_rather_than_created() {
         let settings = settings_of(FILE, "alice");
         let err = apply(FILE, "mallory", &settings, true).unwrap_err().to_string();
-        assert!(err.contains("mallory"), "{err}");
+        // Named precisely. `contains("mallory")` also matched the error raised further
+        // down when the write itself failed, so deleting the guard left this test
+        // green -- which mutation testing caught.
+        assert!(
+            err.contains("no [accounts.mallory] section"),
+            "expected the up-front refusal, got: {err}"
+        );
+
+        // And with nothing to write at all -- every value equal to the defaults, so no
+        // later step could fail -- the guard is the only thing that can refuse.
+        let defaults_only = crate::config::Config::default_settings(FILE).unwrap();
+        let err = apply(FILE, "mallory", &defaults_only, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no [accounts.mallory] section"), "{err}");
+    }
+
+    #[test]
+    fn every_group_of_settings_is_written_not_just_the_listed_ones() {
+        // Guards the reason the hand-kept `SECTIONS` list was deleted: the writer
+        // walks whatever `Settings` serializes to, so every group is reachable. If a
+        // group stopped being written, the round-trip below would lose its value.
+        let mut settings = settings_of(FILE, "alice");
+        settings.attack.candidate_limit = 33;
+        settings.claim.min_scrap = 7.5;
+        settings.quest.delay_secs = 61;
+        settings.boss.max_flux_per_fight = 9.5;
+        settings.upgrade.max_per_cycle = 4;
+
+        let out = apply(FILE, "alice", &settings, true).unwrap();
+        let back = settings_of(&out, "alice");
+        assert_eq!(back.attack.candidate_limit, 33);
+        assert_eq!(back.claim.min_scrap, 7.5);
+        assert_eq!(back.quest.delay_secs, 61);
+        assert_eq!(back.boss.max_flux_per_fight, 9.5);
+        assert_eq!(back.upgrade.max_per_cycle, 4);
     }
 
     #[test]

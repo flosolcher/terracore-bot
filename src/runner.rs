@@ -73,26 +73,11 @@ impl Bot {
             }
             let keys = self.keys.for_account(&account.name)?;
             let s = &account.settings;
-            let mut enabled: Vec<&str> = Vec::new();
-            if s.attack.enabled {
-                enabled.push("attack");
-            }
-            if s.claim.enabled {
-                enabled.push("claim");
-            }
-            if s.quest.enabled && s.quest.collect {
-                enabled.push("quests");
-            }
-            if s.boss.enabled {
-                enabled.push("boss");
-            }
-            if s.upgrade.enabled {
-                enabled.push("upgrade");
-            }
+            let enabled = s.enabled_actions();
 
             // Saying this at startup is the whole point of the active-key gate: the
             // operator learns now that a feature they enabled cannot run.
-            if keys.active.is_none() && (s.boss.enabled || s.upgrade.enabled) {
+            if keys.active.is_none() && s.needs_active_key() {
                 warn!(
                     account = %account.name,
                     "boss fights and/or upgrades are enabled but no active key is in the wallet -- \
@@ -493,23 +478,15 @@ pub fn status(config: &Config) -> Result<()> {
         };
 
         let s = &account.settings;
-        let mut enabled: Vec<&str> = Vec::new();
-        if s.attack.enabled {
-            enabled.push("attack");
-        }
-        if s.claim.enabled {
-            enabled.push("claim");
-        }
-        if s.quest.enabled && s.quest.collect {
-            enabled.push("quests");
-        }
         // An enabled feature with no key is not enabled, and saying so here is the
         // point of the command.
-        if s.boss.enabled {
-            enabled.push(if has("active") { "boss" } else { "boss (NO ACTIVE KEY)" });
-        }
-        if s.upgrade.enabled {
-            enabled.push(if has("active") { "upgrade" } else { "upgrade (NO ACTIVE KEY)" });
+        let mut enabled: Vec<String> = s.enabled_actions().iter().map(|a| a.to_string()).collect();
+        if s.needs_active_key() && !has("active") {
+            for action in enabled.iter_mut() {
+                if action == "boss" || action == "upgrade" {
+                    action.push_str(" (NO ACTIVE KEY)");
+                }
+            }
         }
 
         println!(

@@ -112,20 +112,7 @@ impl Broadcaster {
         id: &str,
         payload: Value,
     ) -> Result<Sent> {
-        let payload = add_tx_hash(id, payload);
-        let json = serde_json::to_string(&payload).expect("a JSON value always re-serializes");
-
-        let (required_auths, required_posting_auths) = match auth {
-            Auth::Active => (vec![account.to_string()], vec![]),
-            Auth::Posting => (vec![], vec![account.to_string()]),
-        };
-
-        let operation = Operation::CustomJson(CustomJson {
-            required_auths,
-            required_posting_auths,
-            id: id.to_string(),
-            json,
-        });
+        let operation = custom_json_operation(account, auth, id, payload);
 
         // `block_ref()` fails rather than handing back a stale reference, so a
         // transaction is never signed against a block the chain has moved past.
@@ -184,6 +171,28 @@ impl Broadcaster {
     }
 }
 
+/// Build the operation, separately from signing it.
+///
+/// Which of the two auth lists the account goes into is the entire difference
+/// between an action a posting key can take and one that moves tokens, so it is
+/// worth being able to test without a node or a key.
+fn custom_json_operation(account: &str, auth: Auth, id: &str, payload: Value) -> Operation {
+    let payload = add_tx_hash(id, payload);
+    let json = serde_json::to_string(&payload).expect("a JSON value always re-serializes");
+
+    let (required_auths, required_posting_auths) = match auth {
+        Auth::Active => (vec![account.to_string()], vec![]),
+        Auth::Posting => (vec![], vec![account.to_string()]),
+    };
+
+    Operation::CustomJson(CustomJson {
+        required_auths,
+        required_posting_auths,
+        id: id.to_string(),
+        json,
+    })
+}
+
 /// The game's idempotency nonce. The client builds it from two `Math.random()` calls
 /// in base 36; the alphabet and length here match what it produces.
 pub fn tx_hash() -> String {
@@ -234,5 +243,41 @@ mod tests {
     #[test]
     fn nonces_differ_between_calls() {
         assert_ne!(tx_hash(), tx_hash());
+    }
+
+    fn built(auth: Auth) -> CustomJson {
+        match custom_json_operation("alice", auth, "terracore_battle", json!({ "target": "bob" })) {
+            Operation::CustomJson(op) => op,
+            other => panic!("expected a custom_json, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_posting_action_asks_only_for_posting_authority() {
+        let op = built(Auth::Posting);
+        assert_eq!(op.required_posting_auths, ["alice"]);
+        assert!(
+            op.required_auths.is_empty(),
+            "a battle must never ask for the active authority"
+        );
+        assert_eq!(op.id, "terracore_battle");
+    }
+
+    #[test]
+    fn a_token_moving_action_asks_only_for_active_authority() {
+        let op = built(Auth::Active);
+        assert_eq!(op.required_auths, ["alice"]);
+        assert!(
+            op.required_posting_auths.is_empty(),
+            "a posting key cannot move tokens, so asking for it would only fail"
+        );
+    }
+
+    #[test]
+    fn the_payload_reaches_the_operation_as_a_json_string() {
+        let op = built(Auth::Posting);
+        let parsed: Value = serde_json::from_str(&op.json).unwrap();
+        assert_eq!(parsed["target"], "bob");
+        assert!(parsed["tx-hash"].is_string());
     }
 }

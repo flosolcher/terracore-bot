@@ -606,6 +606,109 @@ pub fn log_failure(account: &str, action: &str, error: &anyhow::Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::Player;
+    use crate::config::Settings;
+    use crate::hive::Broadcaster;
+    use hivecomb::PrivateKey;
+
+    /// Published in hivecomb's own example and holding no value.
+    const THROWAWAY: &str = "5KQwrPbwdL6PhXujxW37FSSQZ1JiwsST4cqQzDeyXtP79zkvFD3";
+
+    /// Wired to a port nothing listens on. Every assertion below is about a decision
+    /// taken *before* any request, so a test that started reaching the network would
+    /// fail or hang rather than quietly pass.
+    fn parts(active: Option<PrivateKey>) -> (Api, Broadcaster, AccountKeys) {
+        let api = Api::new("http://127.0.0.1:9", Duration::from_millis(50), 0);
+        let hive = Broadcaster::new(
+            vec!["http://127.0.0.1:9".into()],
+            Duration::from_millis(50),
+            60,
+            Duration::from_secs(60),
+            true,
+        )
+        .unwrap();
+        let keys = AccountKeys {
+            posting: PrivateKey::from_wif(THROWAWAY).unwrap(),
+            active,
+        };
+        (api, hive, keys)
+    }
+
+    macro_rules! runner {
+        ($api:expr, $hive:expr, $keys:expr, $settings:expr, $blacklist:expr) => {
+            Runner {
+                api: &$api,
+                hive: &$hive,
+                account: "alice",
+                keys: &$keys,
+                settings: &$settings,
+                blacklist: &$blacklist,
+                stop: Arc::new(AtomicBool::new(false)),
+            }
+        };
+    }
+
+    #[test]
+    fn boss_fights_and_upgrades_refuse_to_run_without_an_active_key() {
+        let mut settings = Settings::default();
+        settings.boss.enabled = true;
+        settings.upgrade.enabled = true;
+
+        let (api, hive, keys) = parts(None);
+        let blacklist = HashSet::new();
+        let runner = runner!(api, hive, keys, settings, blacklist);
+
+        let boss = runner.boss_fights().unwrap();
+        assert_eq!(boss.performed, 0);
+        assert!(
+            boss.skipped_reason.as_deref().unwrap_or_default().contains("active key"),
+            "{:?}",
+            boss.skipped_reason
+        );
+
+        let upgrade = runner.upgrades(&Player::default()).unwrap();
+        assert_eq!(upgrade.performed, 0);
+        assert!(
+            upgrade.skipped_reason.as_deref().unwrap_or_default().contains("active key"),
+            "{:?}",
+            upgrade.skipped_reason
+        );
+    }
+
+    #[test]
+    fn an_active_key_opens_the_gate_and_the_next_refusal_is_a_different_one() {
+        // The counterpart to the test above. Without this, an action that always
+        // skipped for any reason would pass that one for the wrong reason.
+        let mut settings = Settings::default();
+        settings.upgrade.enabled = true;
+
+        let (api, hive, keys) = parts(Some(PrivateKey::from_wif(THROWAWAY).unwrap()));
+        let blacklist = HashSet::new();
+        let runner = runner!(api, hive, keys, settings, blacklist);
+
+        // A stat worth 10,000 SCRAP to raise, and nothing in the wallet to pay with,
+        // so it stops for lack of funds rather than for lack of a key.
+        let player = Player {
+            engineering: 100.0,
+            hive_engine_scrap: 0.0,
+            ..Default::default()
+        };
+        let upgrade = runner.upgrades(&player).unwrap();
+        assert_eq!(upgrade.performed, 0);
+        let reason = upgrade.skipped_reason.unwrap_or_default();
+        assert!(!reason.contains("active key"), "{reason}");
+        assert!(reason.contains("min_scrap_reserve"), "{reason}");
+    }
+
+    #[test]
+    fn a_disabled_action_says_so_rather_than_blaming_the_key() {
+        let settings = Settings::default();
+        let (api, hive, keys) = parts(None);
+        let blacklist = HashSet::new();
+        let runner = runner!(api, hive, keys, settings, blacklist);
+        let reason = runner.boss_fights().unwrap().skipped_reason.unwrap_or_default();
+        assert!(reason.contains("disabled"), "{reason}");
+    }
 
     #[test]
     fn upgrade_prices_match_the_website() {

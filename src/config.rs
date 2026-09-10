@@ -151,10 +151,6 @@ pub struct Web {
     pub bind: String,
     /// How long a Keychain login lasts.
     pub session_hours: u64,
-    /// Allow pasting a private key into the browser. Off by default: importing a WIF
-    /// is a `terracore-bot wallet import` away and does not need to cross a network,
-    /// even a loopback one.
-    pub allow_key_import: bool,
     /// Which Hive account may log in, and as what.
     ///
     /// `admin` changes anything and controls the bot; `operator` may edit only its
@@ -169,7 +165,6 @@ impl Default for Web {
             enabled: false,
             bind: "127.0.0.1:8787".into(),
             session_hours: 12,
-            allow_key_import: false,
             access: BTreeMap::new(),
         }
     }
@@ -231,6 +226,38 @@ pub struct Settings {
     pub quest: QuestSettings,
     pub boss: BossSettings,
     pub upgrade: UpgradeSettings,
+}
+
+impl Settings {
+    /// The actions this account will attempt, in the order a cycle runs them.
+    ///
+    /// Stated once. Start-up and `status` both report this, and two copies of the
+    /// list would eventually disagree about what the bot actually does.
+    pub fn enabled_actions(&self) -> Vec<&'static str> {
+        let mut actions = Vec::new();
+        if self.attack.enabled {
+            actions.push("attack");
+        }
+        if self.claim.enabled {
+            actions.push("claim");
+        }
+        if self.quest.enabled && self.quest.collect {
+            actions.push("quests");
+        }
+        if self.upgrade.enabled {
+            actions.push("upgrade");
+        }
+        if self.boss.enabled {
+            actions.push("boss");
+        }
+        actions
+    }
+
+    /// Whether anything enabled here moves Hive-Engine tokens, and so cannot run
+    /// without an active key in the wallet.
+    pub fn needs_active_key(&self) -> bool {
+        self.boss.enabled || self.upgrade.enabled
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -673,6 +700,35 @@ max_enemy_dodge = 5.0
     #[test]
     fn a_config_with_no_accounts_is_refused() {
         assert!(Config::from_str("[general]\ndry_run = true\n").is_err());
+    }
+
+    #[test]
+    fn the_enabled_action_list_reflects_the_settings() {
+        let mut s = Settings::default();
+        // The defaults: the three a posting key can do, and neither of the two that
+        // spend tokens.
+        assert_eq!(s.enabled_actions(), ["attack", "claim", "quests"]);
+        assert!(!s.needs_active_key());
+
+        s.quest.collect = false;
+        assert_eq!(s.enabled_actions(), ["attack", "claim"]);
+
+        s.boss.enabled = true;
+        assert!(s.needs_active_key());
+        assert!(s.enabled_actions().contains(&"boss"));
+
+        s.upgrade.enabled = true;
+        s.attack.enabled = false;
+        s.claim.enabled = false;
+        assert_eq!(s.enabled_actions(), ["upgrade", "boss"]);
+
+        // Each of the two token-spending actions is enough on its own.
+        let mut only_upgrade = Settings::default();
+        only_upgrade.upgrade.enabled = true;
+        assert!(only_upgrade.needs_active_key());
+        let mut only_boss = Settings::default();
+        only_boss.boss.enabled = true;
+        assert!(only_boss.needs_active_key());
     }
 
     #[test]
