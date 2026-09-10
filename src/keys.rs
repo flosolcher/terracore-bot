@@ -94,6 +94,27 @@ pub fn import(path: &Path, passphrase_env: &str, account: &str, role: Role) -> R
     };
 
     let key = PrivateKey::from_wif(wif.trim()).context("that is not a valid WIF private key")?;
+
+    // The wallet is keyed by public key, so re-adding a key that is already held
+    // replaces its account/role tag rather than storing a second entry. Silently
+    // losing the earlier tag is how an account ends up with an active key and no
+    // posting key, so say it out loud.
+    let already = wallet.index().into_iter().find(|(existing_account, roles)| {
+        (existing_account != account || !roles.iter().any(|r| r == role.as_str()))
+            && wallet
+                .key_for_role(existing_account, Role::Posting)
+                .or_else(|_| wallet.key_for_role(existing_account, Role::Active))
+                .map(|k| k.public_key() == key.public_key())
+                .unwrap_or(false)
+    });
+    if let Some((existing_account, roles)) = already {
+        eprintln!(
+            "warning: this key is already stored for @{existing_account} ({}); that tag \
+             is being replaced, because a wallet holds one entry per key.",
+            roles.join(", ")
+        );
+    }
+
     let public = wallet
         .add_key(&key, Some(account), Some(role))
         .context("storing the key")?;

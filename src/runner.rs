@@ -10,9 +10,10 @@ use tracing::{info, warn};
 
 use crate::actions::{log_failure, Outcome, Runner};
 use crate::api::Api;
-use crate::config::Config;
+use crate::config::{Config, Stat};
 use crate::hive::Broadcaster;
 use crate::keys::KeyStore;
+use crate::targeting::Context as TargetContext;
 
 pub struct Bot {
     config: Config,
@@ -329,76 +330,174 @@ impl Bot {
             }
         }
     }
+}
 
-    /// Read-only: what the bot sees and what it would do, without broadcasting.
-    pub fn status(&mut self) -> Result<()> {
-        self.refresh_blacklist();
-        for account in &self.config.accounts {
-            let keys = self.keys.for_account(&account.name);
-            let player = match self.api.player(&account.name) {
-                Ok(p) => p,
-                Err(e) => {
-                    println!("@{:<16} unreachable: {e:#}", account.name);
-                    continue;
-                }
-            };
+/// Read-only: what the bot sees for each account, and what it is allowed to do.
+///
+/// Deliberately does not unlock the wallet. Which accounts hold which roles is
+/// metadata stored in the clear, so answering "do I have an active key for bob"
+/// costs nothing and needs no passphrase.
+pub fn status(config: &Config) -> Result<()> {
+    let api = Api::new(
+        &config.terracore.api,
+        Duration::from_secs(config.terracore.timeout_secs),
+        config.terracore.retries,
+    );
+    let held = crate::keys::list(&config.wallet_path()).unwrap_or_default();
+
+    for account in &config.accounts {
+        let roles = held.get(&account.name).cloned().unwrap_or_default();
+        let has = |role: &str| roles.iter().any(|r| r == role);
+
+        let player = match api.player(&account.name) {
+            Ok(player) => player,
+            Err(e) => {
+                println!("@{}  unreachable: {:#}\n", account.name, e);
+                continue;
+            }
+        };
+
+        let s = &account.settings;
+        let mut enabled: Vec<&str> = Vec::new();
+        if s.attack.enabled {
+            enabled.push("attack");
+        }
+        if s.claim.enabled {
+            enabled.push("claim");
+        }
+        if s.quest.enabled && s.quest.collect {
+            enabled.push("quests");
+        }
+        // An enabled feature with no key is not enabled, and saying so here is the
+        // point of the command.
+        if s.boss.enabled {
+            enabled.push(if has("active") { "boss" } else { "boss (NO ACTIVE KEY)" });
+        }
+        if s.upgrade.enabled {
+            enabled.push(if has("active") { "upgrade" } else { "upgrade (NO ACTIVE KEY)" });
+        }
+
+        println!(
+            "@{name}{disabled}\n  \
+             level {level:.0}   attacks {attacks:.0}   claims {claims:.0}\n  \
+             stash    {scrap:.4} / {cap:.4}{full}\n  \
+             wallet   {wallet:.4} SCRAP liquid, {stake:.4} staked, {flux:.4} FLUX\n  \
+             stats    damage {dmg:.0}, defense {def:.0}, engineering {eng:.0}, dodge {dodge:.1}%\n  \
+             next up  engineering {eng_cost:.0}, damage {dmg_cost:.0}, defense {def_cost:.0} SCRAP\n  \
+             keys     posting {posting}, active {active}\n  \
+             does     {enabled}\n",
+            name = account.name,
+            disabled = if account.enabled { "" } else { "   (disabled)" },
+            level = player.level,
+            attacks = player.attacks,
+            claims = player.claims,
+            scrap = player.scrap,
+            cap = player.stash_capacity(),
+            full = if player.stash_is_full() { "   STASH FULL" } else { "" },
+            wallet = player.hive_engine_scrap,
+            stake = player.hive_engine_stake,
+            flux = player.flux,
+            dmg = player.stats.damage,
+            def = player.stats.defense,
+            eng = player.stats.engineering,
+            dodge = player.stats.dodge,
+            eng_cost = crate::actions::upgrade_cost(Stat::Engineering, player.engineering),
+            dmg_cost = crate::actions::upgrade_cost(Stat::Damage, player.damage),
+            def_cost = crate::actions::upgrade_cost(Stat::Defense, player.defense),
+            posting = if has("posting") { "yes" } else { "MISSING" },
+            active = if has("active") { "yes" } else { "no" },
+            enabled = if enabled.is_empty() { "nothing".to_string() } else { enabled.join(", ") },
+        );
+    }
+    Ok(())
+}
+
+/// What the bot would attack right now, and why it refused everyone else.
+///
+/// "No opponent found" is not a diagnosis. This answers the question the old bot
+/// could not: whether the board is empty because everyone out-defends you, because
+/// they are all shielded, or because your own filters are too tight.
+pub fn targets(config: &Config, only: Option<&str>, show: usize) -> Result<()> {
+    let api = Api::new(
+        &config.terracore.api,
+        Duration::from_secs(config.terracore.timeout_secs),
+        config.terracore.retries,
+    );
+
+    let mut blacklist: HashSet<String> = config
+        .blacklist
+        .accounts
+        .iter()
+        .map(|n| n.trim().to_ascii_lowercase())
+        .filter(|n| !n.is_empty())
+        .collect();
+    if config.blacklist.skip_own_accounts {
+        for name in config.account_names() {
+            blacklist.insert(name.to_ascii_lowercase());
+        }
+    }
+
+    for account in &config.accounts {
+        if only.is_some_and(|want| !want.eq_ignore_ascii_case(&account.name)) {
+            continue;
+        }
+        let player = match api.player(&account.name) {
+            Ok(player) => player,
+            Err(e) => {
+                println!("@{}  unreachable: {:#}\n", account.name, e);
+                continue;
+            }
+        };
+
+        let settings = &account.settings.attack;
+        let ctx = TargetContext {
+            me: &account.name,
+            my_damage: player.stats.damage,
+            focus_charges: player.focus_charges(),
+            settings,
+            blacklist: &blacklist,
+            now: crate::api::now_ms(),
+        };
+        let board = api.battles(
+            player.stats.damage,
+            settings.candidate_limit,
+            1,
+            ctx.focus_active(),
+        )?;
+        let ranked = crate::targeting::rank(&board, &ctx);
+
+        println!(
+            "@{}  damage {:.0}, {} attacks, {} claims -- {} rows on the board, {} reachable",
+            account.name,
+            player.stats.damage,
+            player.attacks as u32,
+            player.claims as u32,
+            board.len(),
+            ranked.len()
+        );
+        for (i, target) in ranked.iter().take(show).enumerate() {
             println!(
-                "@{name}\n  \
-                 level {level:.0}   attacks {attacks:.0}   claims {claims:.0}\n  \
-                 stash   {scrap:.4} / {cap:.4}{full}\n  \
-                 wallet  {wallet:.4} SCRAP liquid, {stake:.4} staked, {flux:.4} FLUX\n  \
-                 stats   damage {dmg:.0}  defense {def:.0}  engineering {eng:.0}  dodge {dodge:.1}%\n  \
-                 keys    posting {posting}, active {active}\n  \
-                 enabled {enabled}",
-                name = account.name,
-                level = player.level,
-                attacks = player.attacks,
-                claims = player.claims,
-                scrap = player.scrap,
-                cap = player.stash_capacity(),
-                full = if player.stash_is_full() { "  (FULL)" } else { "" },
-                wallet = player.hive_engine_scrap,
-                stake = player.hive_engine_stake,
-                flux = player.flux,
-                dmg = player.stats.damage,
-                def = player.stats.defense,
-                eng = player.stats.engineering,
-                dodge = player.stats.dodge,
-                posting = match &keys {
-                    Ok(_) => "yes",
-                    Err(_) => "MISSING",
-                },
-                active = match &keys {
-                    Ok(k) if k.active.is_some() => "yes",
-                    _ => "no",
-                },
-                enabled = {
-                    let s = &account.settings;
-                    let mut v = Vec::new();
-                    if s.attack.enabled {
-                        v.push("attack");
-                    }
-                    if s.claim.enabled {
-                        v.push("claim");
-                    }
-                    if s.quest.enabled && s.quest.collect {
-                        v.push("quests");
-                    }
-                    if s.boss.enabled {
-                        v.push("boss");
-                    }
-                    if s.upgrade.enabled {
-                        v.push("upgrade");
-                    }
-                    if v.is_empty() {
-                        "nothing".to_string()
-                    } else {
-                        v.join(", ")
-                    }
-                },
+                "  {:>2}. @{:<17} {:>12.2} scrap  {:>12.2} expected  defense {:>7.0}  dodge {:>5.1}%",
+                i + 1,
+                target.username,
+                target.scrap,
+                target.expected_scrap(),
+                target.defense(),
+                target.dodge(),
             );
         }
-        println!("\n{} accounts on the blacklist", self.blacklist.len());
-        Ok(())
+        let tally = crate::targeting::tally(&board, &ctx);
+        if !tally.is_empty() {
+            println!(
+                "  refused: {}",
+                tally
+                    .iter()
+                    .map(|(r, n)| format!("{n} {}", r.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        println!();
     }
+    Ok(())
 }

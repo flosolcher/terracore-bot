@@ -73,7 +73,13 @@ impl Runner<'_> {
     }
 
     /// Sleep in one-second slices so Ctrl-C is not held up by a long delay.
+    ///
+    /// A dry run broadcasts nothing, so there is nothing to pace: waiting would only
+    /// make the rehearsal slower than the real thing.
     fn wait(&self, secs: u64) {
+        if self.hive.is_dry_run() {
+            return;
+        }
         for _ in 0..secs {
             if self.stopping() {
                 return;
@@ -414,6 +420,7 @@ impl Runner<'_> {
 
         let mut flux = planets.flux;
         let mut done = 0;
+        let mut last_reason = String::new();
         for planet in eligible {
             if self.stopping() {
                 break;
@@ -422,12 +429,14 @@ impl Runner<'_> {
                 break;
             }
             if flux - planet.flux < s.min_flux_reserve {
-                debug!(
-                    account = self.account,
-                    planet = %planet.name,
+                last_reason = format!(
+                    "{} costs {} FLUX and only {:.4} is left (reserve {})",
+                    planet.name,
+                    format_number(planet.flux),
                     flux,
-                    "stopping: the next fight would break the FLUX reserve"
+                    s.min_flux_reserve
                 );
+                debug!(account = self.account, reason = %last_reason, "stopping boss fights");
                 break;
             }
 
@@ -454,6 +463,14 @@ impl Runner<'_> {
             flux -= planet.flux;
             done += 1;
             self.wait(s.delay_secs);
+        }
+
+        if done == 0 {
+            return Ok(Outcome::skipped(if last_reason.is_empty() {
+                "no planet fought".to_string()
+            } else {
+                last_reason
+            }));
         }
         Ok(Outcome::did(done))
     }

@@ -50,6 +50,14 @@ enum Command {
     Once,
     /// Show what the bot sees for each account. Reads only.
     Status,
+    /// Show who the bot would attack right now, and why it refused the rest.
+    Targets {
+        /// Limit to one account.
+        account: Option<String>,
+        /// How many ranked targets to print.
+        #[arg(short, long, default_value_t = 10)]
+        limit: usize,
+    },
     /// Parse the config and print the settings each account ends up with.
     Check,
     /// Manage the encrypted key store.
@@ -105,10 +113,10 @@ fn main() -> Result<()> {
     match &cli.command {
         Command::Wallet(command) => wallet(command, &cli),
         Command::Check => check(&cli),
-        Command::Status => {
-            let config = load_config(&cli)?;
-            let mut bot = Bot::new(config, stop_flag()?)?;
-            bot.status()
+        // No wallet, no passphrase, no broadcasts: safe to run anywhere.
+        Command::Status => runner::status(&load_config(&cli)?),
+        Command::Targets { account, limit } => {
+            runner::targets(&load_config(&cli)?, account.as_deref(), *limit)
         }
         Command::Once => {
             let config = load_config(&cli)?;

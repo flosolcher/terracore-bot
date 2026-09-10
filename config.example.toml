@@ -1,0 +1,153 @@
+# terracore-bot -- copy to config.toml and edit.
+#
+# Everything under [defaults] applies to every account. Anything under
+# [accounts.<name>.<section>] overrides just that key for just that account; the
+# rest still comes from [defaults], and anything neither sets falls back to the
+# built-in default. Run `terracore-bot check` to see what each account ends up
+# with.
+#
+# No private keys live here. They go in the encrypted wallet:
+#   terracore-bot wallet init
+#   terracore-bot wallet import --account yourname --role posting
+
+[general]
+# Seconds between cycles. Attacks regenerate over the day, so waking up more
+# often than the old bot's four hours costs nothing -- a cycle with nothing to
+# do is a few API reads.
+cycle_interval_secs = 900
+account_delay_secs = 3
+# Sign everything, broadcast nothing. Also available as --dry-run.
+dry_run = false
+# Skip a cycle when the game is more than this far behind on its own queue.
+# 0 disables the check.
+max_transaction_queue = 0
+
+[hive]
+nodes = [
+    "https://api.hive.blog",
+    "https://api.openhive.network",
+    "https://hive-api.arcange.eu",
+    "https://hived.emre.sh",
+]
+timeout_secs = 15
+expiration_secs = 60
+tapos_max_age_secs = 60
+
+[terracore]
+api = "https://api.terracoregame.com"
+timeout_secs = 20
+retries = 2
+
+[wallet]
+path = "~/.config/terracore-bot/wallet.json"
+# Set this variable for unattended runs; without it the bot prompts on start.
+passphrase_env = "TERRACORE_WALLET_PASSPHRASE"
+
+[blacklist]
+# Never attacked, whatever the numbers say.
+accounts = [
+    # "some-friend",
+]
+# Fetched every cycle and merged in. One account name per line; `#` comments are
+# ignored. A fetch failure keeps the previous list rather than opening the door.
+urls = [
+    # "https://bot.d3v1.de/terracore/blacklist.txt",
+]
+# Accounts configured in this file never attack each other.
+skip_own_accounts = true
+
+# ---------------------------------------------------------------------------
+# Defaults for every account
+# ---------------------------------------------------------------------------
+
+[defaults.attack]
+enabled = true
+# Do not start attacking below this many available attacks.
+min_attacks = 1
+# Attacks per cycle. 0 means "until they run out".
+max_per_cycle = 0
+delay_secs = 20
+# Dodged attacks still spend the attack, so a target that dodges half the time is
+# worth half its scrap. Targets above this dodge percentage are skipped outright.
+max_enemy_dodge = 60.0
+min_target_scrap = 1.0
+# Require damage to exceed defense by at least this much. The game only needs a
+# margin above zero; a buffer absorbs a target upgrading between the battle board
+# and the transaction landing.
+min_damage_margin = 0.0
+# Spend focus charges to attack targets whose defense is above your damage. Each
+# attack on such a target burns one charge, so this is off by default.
+use_focus = false
+candidate_limit = 100
+
+[defaults.claim]
+enabled = true
+min_scrap = 0.1
+min_claims = 1
+# A full stash makes every attack pointless -- looted scrap would have nowhere to
+# go -- so empty it before the attack run rather than after.
+claim_when_stash_full = true
+cooldown_secs = 30
+
+[defaults.quest]
+enabled = true
+# Collect finished missions. This only harvests rewards; it never starts a
+# mission, which would cost SCRAP.
+collect = true
+delay_secs = 5
+
+# --- The two below move Hive-Engine tokens and need an ACTIVE key. -----------
+# Enabling them without an active key in the wallet does nothing but log a
+# warning at startup and a skip each cycle.
+
+[defaults.boss]
+enabled = false
+# Empty means every unlocked planet. Names as the API reports them: Terracore,
+# Oceana, Celestia, Arborealis, ...
+planets = []
+skip_planets = []
+# Never enter a fight costing more FLUX than this.
+max_flux_per_fight = 5.0
+# Stop once the FLUX balance would drop below this.
+min_flux_reserve = 0.0
+# 0 means every planet whose four-hour cooldown has expired.
+max_per_cycle = 0
+# highest_level | cheapest | listed
+order = "highest_level"
+delay_secs = 10
+
+[defaults.upgrade]
+enabled = false
+# engineering raises the mining rate, damage widens the range of reachable
+# targets, defense keeps others out. Costs are the game's own: engineering is
+# n^2, damage and defense are (n/10)^2, against the base stat before items.
+stats = ["engineering"]
+# cheapest | listed
+order = "cheapest"
+# Never spend liquid SCRAP below this balance.
+min_scrap_reserve = 0.0
+# Refuse any single upgrade above this price. 0 disables the cap.
+max_cost = 0.0
+max_per_cycle = 1
+# Stop buying a stat at this value. 0 disables the cap. The game softcaps
+# engineering above 333, where each further point yields half as much.
+max_engineering = 0.0
+max_damage = 0.0
+max_defense = 0.0
+delay_secs = 10
+
+# ---------------------------------------------------------------------------
+# Accounts
+# ---------------------------------------------------------------------------
+
+[accounts.youraccount]
+# enabled = false   # keep the settings, skip the account
+
+# Per-account overrides, if you want them:
+# [accounts.youraccount.attack]
+# max_enemy_dodge = 40.0
+#
+# [accounts.youraccount.upgrade]
+# enabled = true
+# stats = ["engineering", "damage"]
+# min_scrap_reserve = 5000.0
