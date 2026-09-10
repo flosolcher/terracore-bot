@@ -181,7 +181,9 @@ youraccount = "admin"
 a-friend    = "operator"
 ```
 
-Then `terracore-bot run` prints the URL.
+`./setup.sh` offers to fill that in for you. There is **no separate command**:
+`./start.sh` serves the panel alongside the bot and prints the URL on start-up.
+`./start.sh check` says whether it is on and who may log in.
 
 ### Login is Hive Keychain
 

@@ -32,6 +32,9 @@ die()  { printf '%s error:%s %s\n' "$RED" "$OFF" "$*" >&2; exit 1; }
 interactive=1
 [ -t 0 ] || interactive=0
 
+# Set when this run creates the config; empty when one was already there.
+account=""
+
 # ---------------------------------------------------------------------------
 step "Checking the toolchain"
 
@@ -55,7 +58,6 @@ if [ -f "$CONFIG" ]; then
 else
     [ -f "$EXAMPLE" ] || die "$EXAMPLE is missing; run this from a checkout of the repository."
 
-    account=""
     if [ "$interactive" -eq 1 ]; then
         while [ -z "$account" ]; do
             printf 'Your Hive account name (without the @): '
@@ -145,6 +147,85 @@ else
                 ;;
         esac
     done
+fi
+
+# ---------------------------------------------------------------------------
+step "Web control panel"
+
+# `check` reports it, so this is not inferred from the file.
+panel_state=$("$BIN" --config "$CONFIG" check 2>/dev/null | awk '/^panel /{print $2; exit}')
+
+if [ "$panel_state" = "on," ] || [ "$panel_state" = "on" ]; then
+    say "already enabled:"
+    "$BIN" --config "$CONFIG" check | awk '/^panel /{print "    " $0}'
+    note "./start.sh serves it alongside the bot -- there is no separate command"
+elif [ "$interactive" -eq 0 ]; then
+    note "off. To turn it on, set enabled = true under [web] and name yourself"
+    note "in [web.access], then ./start.sh serves it alongside the bot."
+else
+    say "A small local page for watching the bot and editing these settings."
+    say "Login is Hive Keychain -- you sign a challenge with your posting key."
+    say "It binds to 127.0.0.1 only, and ./start.sh serves it alongside the bot."
+    printf 'Enable it? [y/N] '
+    read -r answer || answer=""
+    case "$answer" in
+        [yY]*)
+            admin="$account"
+            printf 'Which account administers it?%s ' \
+                "$([ -n "$admin" ] && printf ' [%s]' "$admin")"
+            read -r typed || typed=""
+            typed=$(printf '%s' "$typed" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]@')
+            [ -n "$typed" ] && admin="$typed"
+            if [ -z "$admin" ]; then
+                note "no account given -- leaving the panel off"
+            elif ! printf '%s' "$admin" | grep -qE '^[a-z0-9.-]{3,16}$'; then
+                note "'$admin' is not a Hive account name -- leaving the panel off"
+            else
+                # Section-aware on purpose. `enabled = false` also appears under
+                # [defaults.boss] and [defaults.upgrade], and flipping those would
+                # quietly switch on the two actions that spend FLUX and SCRAP.
+                awk -v acct="$admin" '\
+                    /^\[/ {
+                        if (section == "[web.access]" && !granted) {
+                            print acct " = \"admin\""; granted = 1
+                        }
+                        section = $0
+                    }
+                    section == "[web]" && /^[[:space:]]*enabled[[:space:]]*=/ {
+                        print "enabled = true"; next
+                    }
+                    section == "[web.access]" && $0 ~ ("^#[[:space:]]*" acct "[[:space:]]*=") {
+                        print acct " = \"admin\""; granted = 1; next
+                    }
+                    section == "[web.access]" && $0 ~ ("^[[:space:]]*" acct "[[:space:]]*=") {
+                        granted = 1
+                    }
+                    { print }
+                    END {
+                        if (section == "[web.access]" && !granted) {
+                            print acct " = \"admin\""
+                        }
+                    }' "$CONFIG" > "$CONFIG.tmp"
+
+                # Never move a config in that the bot cannot load. Validating the
+                # candidate before replacing the original means a rewrite that went
+                # wrong costs nothing.
+                if "$BIN" --config "$CONFIG.tmp" check >/dev/null 2>&1; then
+                    mv "$CONFIG.tmp" "$CONFIG"
+                    say "enabled for @$admin:"
+                    "$BIN" --config "$CONFIG" check | awk '/^panel /{print "    " $0}'
+                else
+                    rm -f "$CONFIG.tmp"
+                    note "could not enable it automatically -- $CONFIG is unchanged."
+                    note "Set enabled = true under [web] and add: $admin = \"admin\""
+                    note "under [web.access]."
+                fi
+            fi
+            ;;
+        *)
+            note "left off -- re-run ./setup.sh later, or edit [web] in $CONFIG"
+            ;;
+    esac
 fi
 
 # ---------------------------------------------------------------------------

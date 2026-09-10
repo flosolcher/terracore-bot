@@ -192,6 +192,23 @@ fn check(cli: &Cli) -> Result<()> {
             ""
         }
     );
+    // Worth stating plainly: whether a port is about to be opened, and who may use
+    // it, should not have to be inferred from the config file.
+    if config.web.enabled {
+        let who: Vec<String> = config
+            .web
+            .access
+            .iter()
+            .map(|(name, role)| format!("{name}={}", role.as_str()))
+            .collect();
+        println!(
+            "panel    on, http://{} -- {}",
+            config.web.bind,
+            who.join(", ")
+        );
+    } else {
+        println!("panel    off");
+    }
     println!();
     for account in &config.accounts {
         println!(
