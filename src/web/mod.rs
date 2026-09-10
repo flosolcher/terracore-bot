@@ -535,12 +535,19 @@ fn forbidden(reason: &str) -> Response<Cursor<Vec<u8>>> {
 fn html(body: &str) -> Response<Cursor<Vec<u8>>> {
     Response::from_data(body.as_bytes().to_vec())
         .with_header(header("Content-Type", "text/html; charset=utf-8"))
-        // Everything is inline and same-origin; the one thing the page must be able
-        // to reach is the Keychain extension, which injects into the page itself.
+        // Everything is inline and same-origin. The extension schemes are not
+        // decoration: Hive Keychain publishes `window.hive_keychain` by appending a
+        // `<script src="chrome-extension://…">` to the page, and that element is
+        // governed by *this* policy -- omit the scheme and the extension never loads,
+        // so there is nothing to log in with. `'unsafe-inline'` covers this page's own
+        // script; the page builds every node through `textContent`, so no value from
+        // the API is ever parsed as markup.
         .with_header(header(
             "Content-Security-Policy",
-            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
-             connect-src 'self'; img-src data:; form-action 'none'; frame-ancestors 'none'",
+            "default-src 'none'; \
+             script-src 'unsafe-inline' chrome-extension: moz-extension: safari-web-extension:; \
+             style-src 'unsafe-inline'; connect-src 'self'; img-src data:; \
+             base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
         ))
         .with_header(header("X-Content-Type-Options", "nosniff"))
         .with_header(header("Referrer-Policy", "no-referrer"))

@@ -209,10 +209,29 @@ place — comments, key order and formatting intact. A value dragged back onto t
 default has its override deleted rather than restated, so an override present is an
 override intended. The bot re-reads the file before its next cycle.
 
+A save is a **replace**, not a merge: the panel sends the whole settings object it
+was given. A hand-written `PUT` carrying only some keys will reset the rest to their
+compiled-in defaults and drop the account's other overrides.
+
 Everything else about the panel is deliberately small: `SameSite=Strict` HttpOnly
 cookie plus a required custom header on every mutation, a content security policy
-with no external origins, loopback by default and a warning in the log if you bind
-it anywhere else.
+that permits no external origin except the browser-extension schemes Keychain needs
+to publish itself, loopback by default, and a warning in the log if you bind it
+anywhere else.
+
+### What is and is not verified
+
+Every route was exercised against a running instance, the role scoping and the config
+round-trip have tests over real HTTP, the authority check is tested offline against
+synthetic authorities and live against the chain, and all four views were rendered in
+a browser.
+
+The one path **not** exercised end to end is the Keychain handshake itself, because
+that needs a posting key for a real account. The pieces around it are covered from
+both sides — challenge issue and reuse, signature recovery, the authority decision,
+session lifetime — but if the browser half misbehaves, the first place to look is the
+`Content-Security-Policy` header in `src/web/mod.rs`: Keychain publishes
+`window.hive_keychain` by injecting a script element, which that policy governs.
 
 ## Design notes
 

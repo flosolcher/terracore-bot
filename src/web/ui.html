@@ -271,7 +271,13 @@ function renderHeader() {
   if (state.me.role === "admin") {
     controls.push(
       el("button", { text: s.paused ? "Resume" : "Pause", onclick: () => control(s.paused ? "resume" : "pause") }),
-      el("button", { text: "Run now", onclick: () => control("run_now") }),
+      // Disabled while paused: the bot leaves the request queued rather than acting
+      // on it, so offering the button would promise something that does not happen.
+      el("button", {
+        text: "Run now", disabled: s.paused || undefined,
+        title: s.paused ? "Resume first — a paused bot starts no cycles" : "Start a cycle now",
+        onclick: () => control("run_now"),
+      }),
     );
   }
   return el("header", {},

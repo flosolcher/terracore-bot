@@ -400,7 +400,10 @@ impl Bot {
                     info!("paused; no new cycles will start until resumed");
                 }
                 was_paused = true;
-                self.sleep_until_woken(5);
+                // A plain wait, not `sleep_until_woken`: that one consumes `run_now`,
+                // so a "run now" pressed while paused used to be swallowed and never
+                // acted on. Left set, it fires as soon as the bot is resumed.
+                self.wait(5);
             } else {
                 if was_paused {
                     info!("resumed");

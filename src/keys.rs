@@ -11,6 +11,7 @@ use anyhow::{bail, Context, Result};
 use hivecomb::keys::Role;
 use hivecomb::wallet::Wallet;
 use hivecomb::PrivateKey;
+use zeroize::Zeroizing;
 
 /// The keys one account has available. Posting is required; active is optional, and
 /// its absence is what disables the features that spend tokens.
@@ -83,7 +84,9 @@ pub fn import(path: &Path, passphrase_env: &str, account: &str, role: Role) -> R
     let passphrase = read_passphrase(passphrase_env, "Wallet passphrase: ", false)?;
     wallet.unlock(&passphrase).context("unlocking the wallet")?;
 
-    let wif = if std::io::stdin().is_terminal() {
+    // Wiped on drop. hivecomb's `PrivateKey` zeroizes its own copy; this is the
+    // copy that would otherwise be left behind in a freed allocation.
+    let wif = Zeroizing::new(if std::io::stdin().is_terminal() {
         rpassword::prompt_password(format!("{role_str} WIF for @{account}: ", role_str = role.as_str()))
             .context("reading the key")?
     } else {
@@ -91,7 +94,7 @@ pub fn import(path: &Path, passphrase_env: &str, account: &str, role: Role) -> R
         std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)
             .context("reading the key from stdin")?;
         line
-    };
+    });
 
     let key = PrivateKey::from_wif(wif.trim()).context("that is not a valid WIF private key")?;
 
@@ -140,11 +143,11 @@ pub fn list(path: &Path) -> Result<std::collections::BTreeMap<String, Vec<String
     Ok(wallet.index())
 }
 
-fn read_passphrase(env_var: &str, prompt: &str, confirm: bool) -> Result<String> {
+fn read_passphrase(env_var: &str, prompt: &str, confirm: bool) -> Result<Zeroizing<String>> {
     if !env_var.is_empty() {
         if let Ok(value) = std::env::var(env_var) {
             if !value.is_empty() {
-                return Ok(value);
+                return Ok(Zeroizing::new(value));
             }
         }
     }
@@ -154,10 +157,14 @@ fn read_passphrase(env_var: &str, prompt: &str, confirm: bool) -> Result<String>
              unattended runs"
         );
     }
-    let passphrase = rpassword::prompt_password(prompt).context("reading the passphrase")?;
+    let passphrase = Zeroizing::new(
+        rpassword::prompt_password(prompt).context("reading the passphrase")?,
+    );
     if confirm {
-        let again = rpassword::prompt_password("Repeat: ").context("reading the passphrase")?;
-        if again != passphrase {
+        let again = Zeroizing::new(
+            rpassword::prompt_password("Repeat: ").context("reading the passphrase")?,
+        );
+        if *again != *passphrase {
             bail!("the two passphrases do not match");
         }
     }

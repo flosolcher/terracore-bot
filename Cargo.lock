@@ -1051,6 +1051,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "zeroize",
 ]
 
 [[package]]

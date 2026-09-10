@@ -34,6 +34,10 @@ tiny_http = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time", "local-time"] }
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+# Already in the tree via hivecomb. Used here so the WIF and the passphrase are
+# wiped when they go out of scope rather than left in a freed allocation -- this
+# program's whole job is holding keys.
+zeroize = "1"
 ctrlc = "3"
 
 [profile.release]
