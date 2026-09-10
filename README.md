@@ -147,6 +147,73 @@ prints the merged result per account.
 
 See [`config.example.toml`](config.example.toml) — every option is documented there.
 
+## The control panel
+
+Optional, off by default. A small web UI for watching the bot and editing the
+settings, served by the bot itself.
+
+```toml
+[web]
+enabled = true
+bind = "127.0.0.1:8787"
+
+[web.access]
+youraccount = "admin"
+a-friend    = "operator"
+```
+
+Then `terracore-bot run` prints the URL.
+
+### Login is Hive Keychain
+
+No password is stored, and no key is entered:
+
+1. the browser asks for a challenge for `@you`,
+2. Keychain signs that exact string with your posting key,
+3. the server recovers the key from the signature and checks it against **your
+   posting authority as the chain reports it**.
+
+Step 3 is the one that matters. Recovering a key from a signature proves only that
+the signature is well formed — a tampered signature simply recovers a *different*
+key. It becomes proof of identity only when the recovered key is checked against an
+authority fetched from Hive. There is a live test for exactly that:
+
+```bash
+cargo test -- --ignored --nocapture
+# refused: that key is not in @edsulivan's posting authority
+```
+
+### Roles
+
+An account not listed in `[web.access]` cannot log in at all, however good its
+signature.
+
+| role | can |
+|---|---|
+| `admin` | every account's settings, pause / resume / run now, the log |
+| `operator` | **only its own** account — cannot see or touch any other |
+| `viewer` | reads; changes nothing |
+
+### Keys are not managed here
+
+The panel shows which authorities the wallet holds — account, posting yes/no, active
+yes/no — and nothing else. Private keys are never displayed and never accepted over
+HTTP. Importing one is a `terracore-bot wallet import` away and does not need to
+cross a network, even a loopback one.
+
+### Editing settings
+
+The TOML file stays the source of truth. The panel shows *effective* values, marks
+the ones that override `[defaults]` with a dot, and on save rewrites the file in
+place — comments, key order and formatting intact. A value dragged back onto the
+default has its override deleted rather than restated, so an override present is an
+override intended. The bot re-reads the file before its next cycle.
+
+Everything else about the panel is deliberately small: `SameSite=Strict` HttpOnly
+cookie plus a required custom header on every mutation, a content security policy
+with no external origins, loopback by default and a warning in the log if you bind
+it anywhere else.
+
 ## Design notes
 
 **Signing never touches the network.** A Hive transaction needs the chain id, which is
@@ -185,6 +252,12 @@ src/
   keys.rs        the encrypted wallet
   actions.rs     attack, claim, missions, boss, upgrade
   runner.rs      one cycle over every account, and the loop around it
+  state.rs       what the bot publishes and the panel reads
+  web/
+    mod.rs       the HTTP server and its routes
+    auth.rs      the Keychain handshake and sessions
+    edit.rs      rewriting the config in place
+    ui.html      the panel, embedded in the binary
 ```
 
 ```bash
@@ -193,9 +266,13 @@ cargo test        # the rules ported from the client are the part worth testing
 
 ## Not done yet
 
-A web UI for managing accounts and settings, with Hive Keychain as the login and
-per-account roles. The config layer is already shaped for it: the TOML stays the source
-of truth and the UI rewrites it.
+- Starting missions (as opposed to collecting them) and opening crates, both of which
+  spend SCRAP.
+- Using consumables — `fury` for four more attacks, `focus` to reach a target above
+  your damage — which the bot understands but never spends.
+- The mission model is read from the game client rather than confirmed against live
+  data: no account checked had a mission in flight. A shape mismatch means "nothing to
+  collect", not a crash.
 
 ## Credit
 

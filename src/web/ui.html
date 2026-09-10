@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>terracore-bot</title>
+<style>
+  :root {
+    --bg: #0d1013;
+    --panel: #14181d;
+    --panel-2: #191e24;
+    --line: #262d35;
+    --text: #d8dee6;
+    --dim: #7d8896;
+    --accent: #ffb347;
+    --good: #5fd68a;
+    --bad: #ff6b6b;
+    --warn: #ffd166;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  a { color: var(--accent); }
+  code, .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 10;
+  }
+  .brand { font-weight: 700; letter-spacing: .04em; color: var(--accent); }
+  .brand span { color: var(--dim); font-weight: 400; }
+  .spacer { flex: 1; }
+
+  .pill {
+    font-family: var(--mono); font-size: 12px; padding: 3px 9px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--dim);
+  }
+  .pill.on   { color: var(--good); border-color: #24503a; }
+  .pill.off  { color: var(--warn); border-color: #4d431f; }
+  .pill.dry  { color: var(--accent); border-color: #4d3a1f; }
+
+  button {
+    font: inherit; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #17120a; font-weight: 600; }
+  button.primary:hover:not(:disabled) { filter: brightness(1.1); color: #17120a; }
+
+  main { max-width: 1120px; margin: 0 auto; padding: 20px; }
+
+  /* Sticky under the header: the settings page is long, and having to scroll all
+     the way back up to change tab is the kind of thing that only annoys you after
+     you have shipped it. */
+  nav.tabs {
+    display: flex; gap: 4px; margin-bottom: 18px; flex-wrap: wrap;
+    position: sticky; top: 53px; z-index: 9;
+    background: var(--bg); padding-top: 8px;
+  }
+  nav.tabs button { border-radius: 6px 6px 0 0; border-bottom-color: transparent; }
+  nav.tabs button.active { color: var(--accent); border-color: var(--line); border-bottom-color: var(--bg); background: var(--panel); }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 16px; margin-bottom: 14px;
+  }
+  .card h2 { margin: 0 0 2px; font-size: 16px; }
+  .card h2 .role { font-size: 11px; color: var(--dim); font-weight: 400; margin-left: 8px; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px 18px; margin-top: 12px; }
+  .stat .k { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); }
+  .stat .v { font-family: var(--mono); font-size: 15px; }
+  .stat .v.full { color: var(--bad); }
+
+  .bar { height: 4px; background: var(--panel-2); border-radius: 2px; overflow: hidden; margin-top: 4px; }
+  .bar > i { display: block; height: 100%; background: var(--good); }
+  .bar > i.full { background: var(--bad); }
+
+  ul.actions { list-style: none; margin: 12px 0 0; padding: 0; border-top: 1px solid var(--line); }
+  ul.actions li { display: flex; gap: 10px; padding: 5px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+  ul.actions li:last-child { border-bottom: 0; }
+  ul.actions .name { width: 80px; color: var(--dim); font-family: var(--mono); }
+  ul.actions .did { color: var(--good); font-family: var(--mono); }
+  ul.actions .why { color: var(--dim); }
+  ul.actions .err { color: var(--bad); }
+
+  fieldset { border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; margin: 0 0 12px; }
+  legend { padding: 0 6px; color: var(--accent); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+  .field { display: grid; grid-template-columns: 220px 1fr; gap: 12px; align-items: center; padding: 5px 0; }
+  .field > label { color: var(--dim); font-size: 13px; }
+  .field.changed > label { color: var(--text); }
+  .field.changed > label::after { content: " ●"; color: var(--accent); font-size: 10px; }
+  .field .hint { grid-column: 2; font-size: 12px; color: var(--dim); margin-top: -2px; }
+  input[type=text], input[type=number], select {
+    font: inherit; font-family: var(--mono); color: var(--text); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 5px; padding: 5px 8px; width: 100%; max-width: 320px;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+  input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--accent); }
+  .checks { display: flex; gap: 14px; flex-wrap: wrap; }
+  .checks label { display: flex; gap: 5px; align-items: center; color: var(--text); font-family: var(--mono); font-size: 13px; }
+
+  pre.log {
+    background: #090b0d; border: 1px solid var(--line); border-radius: 6px; padding: 12px;
+    font-family: var(--mono); font-size: 12px; line-height: 1.55; max-height: 65vh;
+    overflow: auto; white-space: pre-wrap; word-break: break-word; margin: 0;
+  }
+  .note { color: var(--dim); font-size: 13px; }
+  .err-box { border-color: #5b2b2b; background: #1d1315; color: #ffb4b4; }
+
+  /* Login */
+  .login { max-width: 420px; margin: 12vh auto; }
+  .login h1 { font-size: 20px; margin: 0 0 4px; color: var(--accent); }
+  .login input { max-width: none; margin: 10px 0; }
+  .login button { width: 100%; padding: 9px; }
+  table.keys { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 13px; }
+  table.keys th { text-align: left; color: var(--dim); font-weight: 400; font-size: 11px;
+                  text-transform: uppercase; letter-spacing: .06em; padding-bottom: 6px; }
+  table.keys td { padding: 5px 0; border-top: 1px solid var(--line); }
+  .yes { color: var(--good); } .no { color: var(--dim); }
+</style>
+</head>
+<body>
+
+<div id="app"></div>
+
+<script>
+"use strict";
+
+// --- plumbing --------------------------------------------------------------
+
+// Every request carries the header the server demands on mutations. Combined with a
+// SameSite=Strict cookie that is what stops another origin acting as you.
+async function api(path, options = {}) {
+  const response = await fetch(path, {
+    credentials: "same-origin",
+    headers: { "X-Terracore-UI": "1", "Content-Type": "application/json" },
+    ...options,
+  });
+  let body = null;
+  try { body = await response.json(); } catch (_) { /* an empty body is fine */ }
+  if (!response.ok) {
+    const error = new Error((body && body.error) || `HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
+  return body;
+}
+
+const el = (tag, attrs = {}, ...children) => {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs)) {
+    if (key === "class") node.className = value;
+    else if (key === "text") node.textContent = value;
+    else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    else if (value !== null && value !== undefined && value !== false) node.setAttribute(key, value);
+  }
+  for (const child of children.flat()) {
+    if (child === null || child === undefined || child === false) continue;
+    node.append(child.nodeType ? child : document.createTextNode(String(child)));
+  }
+  return node;
+};
+
+const num = (value, digits = 2) =>
+  (value === null || value === undefined) ? "—"
+    : Number(value).toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
+
+const ago = (epochSeconds, now) => {
+  if (!epochSeconds) return "never";
+  const seconds = Math.max(0, (now || Math.floor(Date.now() / 1000)) - epochSeconds);
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m ago`;
+};
+
+const humanize = (key) => key.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
+
+// --- settings schema -------------------------------------------------------
+// Types come from the values the server sends; only the closed sets and the hints
+// need saying here, so a new setting shows up in the UI without touching this file.
+
+const ENUMS = {
+  "boss.order": ["highest_level", "cheapest", "listed"],
+  "upgrade.order": ["cheapest", "listed"],
+};
+const CHOICES = { "upgrade.stats": ["engineering", "damage", "defense"] };
+const HINTS = {
+  "attack.max_per_cycle": "0 means until the attacks run out",
+  "attack.max_enemy_dodge": "a dodged attack still spends the attack",
+  "attack.min_damage_margin": "how far your damage must exceed their defense",
+  "attack.use_focus": "spend a focus charge to hit targets above your damage",
+  "claim.claim_when_stash_full": "a full stash makes every attack pointless",
+  "quest.collect": "only harvests finished missions; never starts a paid one",
+  "boss.enabled": "burns FLUX — needs an active key",
+  "boss.planets": "empty means every unlocked planet",
+  "boss.max_per_cycle": "0 means every planet off cooldown",
+  "upgrade.enabled": "burns SCRAP — needs an active key",
+  "upgrade.max_cost": "0 disables the cap",
+  "upgrade.max_engineering": "0 disables the cap",
+  "upgrade.max_damage": "0 disables the cap",
+  "upgrade.max_defense": "0 disables the cap",
+  "upgrade.min_scrap_reserve": "never spend your liquid balance below this",
+};
+
+const state = {
+  me: null, status: null, config: null, keys: null,
+  tab: "accounts", timer: null, saving: null, flash: null,
+};
+
+// --- login -----------------------------------------------------------------
+
+function renderLogin(message) {
+  const account = el("input", { type: "text", placeholder: "your Hive account", autocapitalize: "none", spellcheck: "false" });
+  const note = el("p", { class: "note", text: message || "" });
+  const button = el("button", { class: "primary", text: "Sign in with Keychain" });
+
+  button.addEventListener("click", async () => {
+    const name = account.value.trim().toLowerCase().replace(/^@/, "");
+    if (!name) { note.textContent = "Enter your account name."; return; }
+    if (!window.hive_keychain) {
+      note.textContent = "Hive Keychain was not found. Install the extension, then reload.";
+      return;
+    }
+    button.disabled = true;
+    note.textContent = "Requesting a challenge…";
+    try {
+      const { message: challenge } = await api("/api/challenge", {
+        method: "POST", body: JSON.stringify({ account: name }),
+      });
+      note.textContent = "Approve the signature in Keychain…";
+      // The key never leaves the extension; what comes back is a signature over the
+      // exact string the server issued.
+      const signed = await new Promise((resolve, reject) => {
+        window.hive_keychain.requestSignBuffer(name, challenge, "Posting", (result) => {
+          if (result && result.success) resolve(result.result);
+          else reject(new Error((result && (result.message || result.error)) || "Keychain refused"));
+        });
+      });
+      await api("/api/login", { method: "POST", body: JSON.stringify({ message: challenge, signature: signed }) });
+      await boot();
+    } catch (e) {
+      note.textContent = e.message;
+      button.disabled = false;
+    }
+  });
+  account.addEventListener("keydown", (e) => { if (e.key === "Enter") button.click(); });
+
+  document.getElementById("app").replaceChildren(
+    el("div", { class: "login" },
+      el("div", { class: "card" },
+        el("h1", { text: "terracore-bot" }),
+        el("p", { class: "note", text: "Sign a challenge with your posting key. Nothing is stored but the signature's verdict." }),
+        account, button, note,
+      ),
+    ),
+  );
+  account.focus();
+}
+
+// --- chrome ----------------------------------------------------------------
+
+function renderHeader() {
+  const s = state.status || {};
+  const controls = [];
+  if (state.me.role === "admin") {
+    controls.push(
+      el("button", { text: s.paused ? "Resume" : "Pause", onclick: () => control(s.paused ? "resume" : "pause") }),
+      el("button", { text: "Run now", onclick: () => control("run_now") }),
+    );
+  }
+  return el("header", {},
+    el("div", { class: "brand" }, "terracore", el("span", { text: "-bot" })),
+    el("span", { class: `pill ${s.paused ? "off" : "on"}`, text: s.paused ? "paused" : "running" }),
+    s.dry_run ? el("span", { class: "pill dry", text: "dry run" }) : null,
+    el("span", { class: "pill", text: `cycle ${s.cycle || 0} · ${ago(s.cycle_finished, s.now)}` }),
+    el("div", { class: "spacer" }),
+    ...controls,
+    el("span", { class: "pill", text: `@${state.me.account} · ${state.me.role}` }),
+    el("button", { text: "Sign out", onclick: signOut }),
+  );
+}
+
+async function control(action) {
+  try {
+    await api("/api/control", { method: "POST", body: JSON.stringify({ action }) });
+    await refresh();
+  } catch (e) { flash(e.message); }
+}
+
+async function signOut() {
+  try { await api("/api/logout", { method: "POST" }); } catch (_) { /* going anyway */ }
+  state.me = null;
+  if (state.timer) clearInterval(state.timer);
+  renderLogin("Signed out.");
+}
+
+function flash(text) {
+  state.flash = text;
+  render();
+  setTimeout(() => { if (state.flash === text) { state.flash = null; render(); } }, 6000);
+}
+
+// --- tabs ------------------------------------------------------------------
+
+function renderAccounts() {
+  const accounts = Object.entries((state.status && state.status.accounts) || {});
+  if (!accounts.length) {
+    return el("div", { class: "card" },
+      el("p", { class: "note", text: "No cycle has finished yet. The first one runs on start-up." }));
+  }
+  const now = state.status.now;
+  return accounts.map(([name, a]) => {
+    const p = a.player;
+    const used = p && p.stash_capacity > 0 ? Math.min(100, (p.scrap / p.stash_capacity) * 100) : 0;
+    return el("div", { class: "card" },
+      el("h2", {}, `@${name}`, el("span", { class: "role", text: ago(a.at, now) })),
+      a.error ? el("p", { class: "note err-box", text: a.error }) : null,
+      p ? el("div", { class: "grid" },
+        stat("level", num(p.level, 0)),
+        stat("attacks", num(p.attacks, 0)),
+        stat("claims", num(p.claims, 0)),
+        stat("damage", num(p.damage, 0)),
+        stat("defense", num(p.defense, 0)),
+        stat("engineering", num(p.engineering, 0)),
+        stat("dodge", `${num(p.dodge, 1)}%`),
+        stat("flux", num(p.flux, 4)),
+      ) : null,
+      p ? el("div", { class: "stat", style: "margin-top:12px" },
+        el("div", { class: "k", text: p.stash_full ? "stash — full" : "stash" }),
+        el("div", { class: `v ${p.stash_full ? "full" : ""}`, text: `${num(p.scrap)} / ${num(p.stash_capacity)}` }),
+        el("div", { class: "bar" }, el("i", { class: p.stash_full ? "full" : "", style: `width:${used}%` })),
+      ) : null,
+      p ? el("div", { class: "grid", style: "margin-top:12px" },
+        stat("wallet SCRAP", num(p.wallet_scrap)),
+        stat("staked", num(p.staked)),
+      ) : null,
+      a.actions && a.actions.length ? el("ul", { class: "actions" },
+        a.actions.map((r) => el("li", {},
+          el("span", { class: "name", text: r.action }),
+          r.failed ? el("span", { class: "err", text: r.failed })
+            : r.skipped ? el("span", { class: "why", text: r.skipped })
+              : el("span", { class: "did", text: `×${r.count}` }),
+        )),
+      ) : null,
+    );
+  });
+}
+
+const stat = (label, value) =>
+  el("div", { class: "stat" }, el("div", { class: "k", text: label }), el("div", { class: "v", text: value }));
+
+function renderSettings() {
+  if (!state.config) return el("p", { class: "note", text: "Loading…" });
+  const defaults = state.config.defaults;
+
+  return state.config.accounts.map((account) => {
+    // A working copy: nothing is sent until Save, so a mistyped number can be
+    // abandoned by switching tabs.
+    const draft = JSON.parse(JSON.stringify(account.settings));
+    let enabled = account.enabled;
+    const body = el("div", {});
+
+    const redraw = () => {
+      body.replaceChildren(
+        ...Object.keys(draft).map((section) =>
+          el("fieldset", {},
+            el("legend", { text: section }),
+            ...Object.keys(draft[section]).map((key) =>
+              fieldFor(section, key, draft, defaults, account.writable, redraw)),
+          ),
+        ),
+      );
+    };
+    redraw();
+
+    const status = el("span", { class: "note" });
+    return el("div", { class: "card" },
+      el("h2", {}, `@${account.name}`,
+        el("span", { class: "role", text: account.writable ? "editable" : "read-only" })),
+      el("div", { class: "field" },
+        el("label", { text: "Account enabled" }),
+        el("input", {
+          type: "checkbox", checked: enabled, disabled: !account.writable,
+          onchange: (e) => { enabled = e.target.checked; },
+        })),
+      body,
+      account.writable ? el("div", { style: "display:flex;gap:10px;align-items:center" },
+        el("button", {
+          class: "primary", text: "Save",
+          onclick: async (e) => {
+            e.target.disabled = true;
+            status.textContent = "Saving…";
+            try {
+              await api(`/api/accounts/${encodeURIComponent(account.name)}`, {
+                method: "PUT", body: JSON.stringify({ enabled, settings: draft }),
+              });
+              status.textContent = "Saved — the bot reloads before its next cycle.";
+              await loadConfig();
+            } catch (err) {
+              status.textContent = err.message;
+            } finally { e.target.disabled = false; }
+          },
+        }),
+        el("button", { text: "Revert", onclick: () => render() }),
+        status,
+      ) : null,
+    );
+  });
+}
+
+function fieldFor(section, key, draft, defaults, writable, redraw) {
+  const path = `${section}.${key}`;
+  const value = draft[section][key];
+  const fallback = defaults[section] ? defaults[section][key] : undefined;
+  const changed = JSON.stringify(value) !== JSON.stringify(fallback);
+  const set = (v) => { draft[section][key] = v; redraw(); };
+
+  let input;
+  if (CHOICES[path]) {
+    input = el("div", { class: "checks" }, CHOICES[path].map((choice) =>
+      el("label", {},
+        el("input", {
+          type: "checkbox", checked: value.includes(choice), disabled: !writable,
+          onchange: (e) => set(e.target.checked
+            ? [...value, choice]
+            : value.filter((v) => v !== choice)),
+        }), choice)));
+  } else if (ENUMS[path]) {
+    input = el("select", { disabled: !writable, onchange: (e) => set(e.target.value) },
+      ENUMS[path].map((option) => el("option", { value: option, selected: option === value }, option)));
+  } else if (typeof value === "boolean") {
+    input = el("input", { type: "checkbox", checked: value, disabled: !writable,
+      onchange: (e) => set(e.target.checked) });
+  } else if (Array.isArray(value)) {
+    input = el("input", { type: "text", value: value.join(", "), disabled: !writable,
+      placeholder: "comma separated",
+      onchange: (e) => set(e.target.value.split(",").map((s) => s.trim()).filter(Boolean)) });
+  } else {
+    input = el("input", { type: "number", value, step: "any", disabled: !writable,
+      onchange: (e) => set(e.target.value === "" ? 0 : Number(e.target.value)) });
+  }
+
+  return el("div", { class: `field ${changed ? "changed" : ""}` },
+    el("label", { text: humanize(key), title: changed ? `overrides the default of ${JSON.stringify(fallback)}` : "inherited from [defaults]" }),
+    input,
+    HINTS[path] ? el("div", { class: "hint", text: HINTS[path] }) : null,
+  );
+}
+
+function renderKeys() {
+  const held = (state.keys && state.keys.keys) || {};
+  const names = Object.keys(held);
+  return el("div", { class: "card" },
+    el("h2", { text: "Keys" }),
+    el("p", { class: "note" },
+      "Which authorities the encrypted wallet holds. Private keys are never shown here and never leave the wallet — ",
+      "import them with ", el("code", { text: "terracore-bot wallet import" }), "."),
+    names.length ? el("table", { class: "keys" },
+      el("tr", {}, el("th", { text: "account" }), el("th", { text: "posting" }), el("th", { text: "active" }),
+        el("th", { text: "can do" })),
+      names.map((name) => {
+        const roles = held[name] || [];
+        const posting = roles.includes("posting");
+        const active = roles.includes("active");
+        return el("tr", {},
+          el("td", { text: `@${name}` }),
+          el("td", { class: posting ? "yes" : "no", text: posting ? "yes" : "—" }),
+          el("td", { class: active ? "yes" : "no", text: active ? "yes" : "—" }),
+          el("td", { class: "no", text: active ? "everything" : posting ? "attack, claim, missions" : "nothing" }),
+        );
+      }),
+    ) : el("p", { class: "note", text: "The wallet holds no keys yet." }),
+  );
+}
+
+function renderLog() {
+  const box = el("pre", { class: "log", text: "Loading…" });
+  api("/api/log?limit=400")
+    .then(({ lines }) => {
+      box.textContent = lines.map((l) => l.text).join("\n") || "(nothing logged yet)";
+      box.scrollTop = box.scrollHeight;
+    })
+    .catch((e) => { box.textContent = e.message; });
+  return el("div", { class: "card" }, el("h2", { text: "Log" }), box);
+}
+
+// --- shell -----------------------------------------------------------------
+
+function render() {
+  const tabs = ["accounts", "settings", "keys"];
+  if (state.me.role === "admin") tabs.push("log");
+
+  document.getElementById("app").replaceChildren(
+    renderHeader(),
+    el("main", {},
+      state.flash ? el("div", { class: "card err-box", text: state.flash }) : null,
+      el("nav", { class: "tabs" }, tabs.map((tab) =>
+        el("button", {
+          class: state.tab === tab ? "active" : "", text: humanize(tab),
+          onclick: () => { state.tab = tab; render(); },
+        }))),
+      state.tab === "accounts" ? renderAccounts()
+        : state.tab === "settings" ? renderSettings()
+          : state.tab === "keys" ? renderKeys()
+            : renderLog(),
+    ),
+  );
+}
+
+async function refresh() {
+  try {
+    state.status = await api("/api/status");
+    // Only the header and the account cards move on a poll; redrawing the settings
+    // form under someone's cursor would throw away what they were typing.
+    if (state.tab === "accounts") render();
+    else document.querySelector("header").replaceWith(renderHeader());
+  } catch (e) {
+    if (e.status === 401) { renderLogin("Session expired."); if (state.timer) clearInterval(state.timer); }
+  }
+}
+
+async function loadConfig() {
+  state.config = await api("/api/config");
+  if (state.tab === "settings") render();
+}
+
+async function boot() {
+  try {
+    state.me = await api("/api/me");
+  } catch (e) {
+    renderLogin(e.status === 401 ? "" : e.message);
+    return;
+  }
+  state.status = await api("/api/status");
+  render();
+  loadConfig().catch((e) => flash(e.message));
+  api("/api/keys").then((k) => { state.keys = k; if (state.tab === "keys") render(); }).catch(() => {});
+  if (state.timer) clearInterval(state.timer);
+  state.timer = setInterval(refresh, 5000);
+}
+
+boot();
+</script>
+</body>
+</html>

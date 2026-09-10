@@ -13,6 +13,7 @@ use crate::api::Api;
 use crate::config::{Config, Stat};
 use crate::hive::Broadcaster;
 use crate::keys::KeyStore;
+use crate::state::{epoch_secs, AccountStatus, ActionResult, PlayerSnapshot, Shared};
 use crate::targeting::Context as TargetContext;
 
 pub struct Bot {
@@ -25,10 +26,13 @@ pub struct Bot {
     /// honoured across the pre-claim and the end-of-cycle claim.
     last_claim: HashMap<String, Instant>,
     stop: Arc<AtomicBool>,
+    /// What the control panel reads and writes. Present whether or not the panel is
+    /// running, so the bot has one code path rather than two.
+    shared: Arc<Shared>,
 }
 
 impl Bot {
-    pub fn new(config: Config, stop: Arc<AtomicBool>) -> Result<Self> {
+    pub fn new(config: Config, stop: Arc<AtomicBool>, shared: Arc<Shared>) -> Result<Self> {
         let api = Api::new(
             &config.terracore.api,
             Duration::from_secs(config.terracore.timeout_secs),
@@ -51,6 +55,7 @@ impl Bot {
             hive,
             keys,
             stop,
+            shared,
         };
         bot.rebuild_blacklist();
         Ok(bot)
@@ -173,7 +178,20 @@ impl Bot {
 
     /// Run every account once.
     pub fn cycle(&mut self) -> Result<()> {
+        self.reload_if_asked();
         self.refresh_blacklist();
+
+        {
+            let mut board = self.shared.status();
+            board.cycle += 1;
+            board.cycle_started = epoch_secs();
+            board.running = true;
+            board.dry_run = self.hive.is_dry_run();
+            board.blacklist_size = self.blacklist.len();
+        }
+        // Whatever happens below -- an unreachable node, a panic upstream -- the
+        // panel must not be left saying "running" forever.
+        let _finish = FinishCycle(Arc::clone(&self.shared));
 
         if self.config.general.max_transaction_queue > 0 {
             match self.api.transaction_queue() {
@@ -204,15 +222,28 @@ impl Bot {
             if !account.enabled {
                 continue;
             }
-            if let Err(e) = self.run_account(&account) {
-                warn!(account = %account.name, error = %format!("{e:#}"), "account failed; moving on");
-            }
+            let status = match self.run_account(&account) {
+                Ok(status) => status,
+                Err(e) => {
+                    let message = format!("{e:#}");
+                    warn!(account = %account.name, error = %message, "account failed; moving on");
+                    AccountStatus {
+                        at: epoch_secs(),
+                        error: Some(message),
+                        ..Default::default()
+                    }
+                }
+            };
+            self.shared
+                .status()
+                .accounts
+                .insert(account.name.clone(), status);
             self.wait(self.config.general.account_delay_secs);
         }
         Ok(())
     }
 
-    fn run_account(&mut self, account: &crate::config::Account) -> Result<()> {
+    fn run_account(&mut self, account: &crate::config::Account) -> Result<AccountStatus> {
         let keys = self.keys.for_account(&account.name)?;
         let player = self
             .api
@@ -231,6 +262,12 @@ impl Bot {
             "state",
         );
 
+        let mut report = AccountStatus {
+            at: epoch_secs(),
+            player: Some(PlayerSnapshot::from(&player)),
+            ..Default::default()
+        };
+
         let runner = Runner {
             api: &self.api,
             hive: &self.hive,
@@ -248,8 +285,8 @@ impl Bot {
             && self.claim_cooldown_ok(&account.name, &account.settings)
         {
             match runner.claim(&player) {
-                Ok(outcome) => self.note("pre-claim", &account.name, &outcome),
-                Err(e) => log_failure(&account.name, "pre-claim", &e),
+                Ok(outcome) => self.note("pre-claim", &account.name, &outcome, &mut report),
+                Err(e) => self.note_failure("pre-claim", &account.name, &e, &mut report),
             }
             self.last_claim.insert(account.name.clone(), Instant::now());
             // Give the chain a moment before attacking against the new stash.
@@ -257,12 +294,13 @@ impl Bot {
         }
 
         match runner.attack(&player) {
-            Ok(outcome) => self.note("attack", &account.name, &outcome),
-            Err(e) => log_failure(&account.name, "attack", &e),
+            Ok(outcome) => self.note("attack", &account.name, &outcome, &mut report),
+            Err(e) => self.note_failure("attack", &account.name, &e, &mut report),
         }
 
         // Re-read: attacking moves the stash, the attack count and the claim count.
         let player = self.api.player(&account.name).unwrap_or(player);
+        report.player = Some(PlayerSnapshot::from(&player));
 
         if self.claim_cooldown_ok(&account.name, &account.settings) {
             match runner.claim(&player) {
@@ -270,28 +308,28 @@ impl Bot {
                     if outcome.performed > 0 {
                         self.last_claim.insert(account.name.clone(), Instant::now());
                     }
-                    self.note("claim", &account.name, &outcome);
+                    self.note("claim", &account.name, &outcome, &mut report);
                 }
-                Err(e) => log_failure(&account.name, "claim", &e),
+                Err(e) => self.note_failure("claim", &account.name, &e, &mut report),
             }
         }
 
         match runner.quests() {
-            Ok(outcome) => self.note("quests", &account.name, &outcome),
-            Err(e) => log_failure(&account.name, "quests", &e),
+            Ok(outcome) => self.note("quests", &account.name, &outcome, &mut report),
+            Err(e) => self.note_failure("quests", &account.name, &e, &mut report),
         }
 
         match runner.upgrades(&player) {
-            Ok(outcome) => self.note("upgrade", &account.name, &outcome),
-            Err(e) => log_failure(&account.name, "upgrade", &e),
+            Ok(outcome) => self.note("upgrade", &account.name, &outcome, &mut report),
+            Err(e) => self.note_failure("upgrade", &account.name, &e, &mut report),
         }
 
         match runner.boss_fights() {
-            Ok(outcome) => self.note("boss", &account.name, &outcome),
-            Err(e) => log_failure(&account.name, "boss", &e),
+            Ok(outcome) => self.note("boss", &account.name, &outcome, &mut report),
+            Err(e) => self.note_failure("boss", &account.name, &e, &mut report),
         }
 
-        Ok(())
+        Ok(report)
     }
 
     fn claim_cooldown_ok(&self, account: &str, settings: &crate::config::Settings) -> bool {
@@ -301,33 +339,130 @@ impl Bot {
         }
     }
 
-    fn note(&self, action: &str, account: &str, outcome: &Outcome) {
+    fn note(&self, action: &str, account: &str, outcome: &Outcome, report: &mut AccountStatus) {
         match &outcome.skipped_reason {
             Some(reason) => info!(account, action, "skipped: {reason}"),
             None => info!(account, action, count = outcome.performed, "done"),
+        }
+        report.actions.push(ActionResult {
+            action: action.to_string(),
+            count: outcome.performed,
+            skipped: outcome.skipped_reason.clone(),
+            failed: None,
+        });
+    }
+
+    fn note_failure(
+        &self,
+        action: &str,
+        account: &str,
+        error: &anyhow::Error,
+        report: &mut AccountStatus,
+    ) {
+        log_failure(account, action, error);
+        report.actions.push(ActionResult {
+            action: action.to_string(),
+            count: 0,
+            skipped: None,
+            failed: Some(format!("{error:#}")),
+        });
+    }
+
+    /// Pick up a config the panel wrote.
+    ///
+    /// Only the parts that can change under a running bot are applied. The node list,
+    /// the wallet and the dry-run flag shape objects built once at start-up, so a
+    /// change there is reported rather than half-applied.
+    fn reload_if_asked(&mut self) {
+        let asked = {
+            let mut control = self.shared.control();
+            std::mem::take(&mut control.reload)
+        };
+        if !asked {
+            return;
+        }
+        match Config::load(&self.config.path) {
+            Ok(new) => {
+                if new.hive.nodes != self.config.hive.nodes
+                    || new.wallet.path != self.config.wallet.path
+                    || new.terracore.api != self.config.terracore.api
+                    || new.general.dry_run != self.config.general.dry_run
+                {
+                    warn!(
+                        "[hive], [wallet], [terracore] and dry_run are read once at start-up -- \
+                         restart to apply those. Account settings have been reloaded."
+                    );
+                }
+                self.config.accounts = new.accounts;
+                self.config.blacklist = new.blacklist;
+                self.config.general.cycle_interval_secs = new.general.cycle_interval_secs;
+                self.config.general.account_delay_secs = new.general.account_delay_secs;
+                self.config.general.max_transaction_queue = new.general.max_transaction_queue;
+                self.rebuild_blacklist();
+                info!(accounts = self.config.accounts.len(), "config reloaded");
+            }
+            Err(e) => warn!(error = %format!("{e:#}"), "the edited config would not load; keeping the running one"),
         }
     }
 
     /// The daemon loop.
     pub fn run(&mut self) -> Result<()> {
-        let interval = self.config.general.cycle_interval_secs;
+        let mut was_paused = false;
         loop {
-            let started = Instant::now();
-            if let Err(e) = self.cycle() {
-                warn!(error = %format!("{e:#}"), "cycle failed");
+            let paused = self.shared.control().paused;
+            if paused {
+                if !was_paused {
+                    info!("paused; no new cycles will start until resumed");
+                }
+                was_paused = true;
+                self.sleep_until_woken(5);
+            } else {
+                if was_paused {
+                    info!("resumed");
+                }
+                was_paused = false;
+
+                let started = Instant::now();
+                if let Err(e) = self.cycle() {
+                    warn!(error = %format!("{e:#}"), "cycle failed");
+                }
+                if self.stopping() {
+                    info!("stopping");
+                    return Ok(());
+                }
+                let elapsed = started.elapsed().as_secs();
+                let sleep = self
+                    .config
+                    .general
+                    .cycle_interval_secs
+                    .saturating_sub(elapsed)
+                    .max(30);
+                info!(seconds = sleep, "cycle complete; sleeping");
+                self.sleep_until_woken(sleep);
             }
             if self.stopping() {
                 info!("stopping");
                 return Ok(());
             }
-            let elapsed = started.elapsed().as_secs();
-            let sleep = interval.saturating_sub(elapsed).max(30);
-            info!(seconds = sleep, "cycle complete; sleeping");
-            self.wait(sleep);
+        }
+    }
+
+    /// Sleep, but wake early for a stop or for the panel's "run now".
+    fn sleep_until_woken(&self, secs: u64) {
+        for _ in 0..secs {
             if self.stopping() {
-                info!("stopping");
-                return Ok(());
+                return;
             }
+            {
+                let mut control = self.shared.control();
+                if control.run_now {
+                    control.run_now = false;
+                    drop(control);
+                    info!("running a cycle on request");
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_secs(1));
         }
     }
 }
@@ -500,4 +635,15 @@ pub fn targets(config: &Config, only: Option<&str>, show: usize) -> Result<()> {
         println!();
     }
     Ok(())
+}
+
+/// Clears the panel's "running" flag when a cycle ends, however it ends.
+struct FinishCycle(Arc<Shared>);
+
+impl Drop for FinishCycle {
+    fn drop(&mut self) {
+        let mut board = self.0.status();
+        board.running = false;
+        board.cycle_finished = epoch_secs();
+    }
 }

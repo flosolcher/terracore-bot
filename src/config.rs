@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Resolved configuration: defaults already merged into every account.
 #[derive(Debug, Clone)]
@@ -19,6 +19,7 @@ pub struct Config {
     pub terracore: Terracore,
     pub wallet: WalletConfig,
     pub blacklist: Blacklist,
+    pub web: Web,
     pub accounts: Vec<Account>,
     /// Where this was loaded from, for error messages and for the future web UI.
     pub path: PathBuf,
@@ -140,6 +141,80 @@ impl Default for Blacklist {
     }
 }
 
+/// The local control panel. Off unless asked for.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Web {
+    pub enabled: bool,
+    /// Loopback by default. Anything else exposes a panel that can change what your
+    /// accounts do, so put a TLS reverse proxy in front of it.
+    pub bind: String,
+    /// How long a Keychain login lasts.
+    pub session_hours: u64,
+    /// Allow pasting a private key into the browser. Off by default: importing a WIF
+    /// is a `terracore-bot wallet import` away and does not need to cross a network,
+    /// even a loopback one.
+    pub allow_key_import: bool,
+    /// Which Hive account may log in, and as what.
+    ///
+    /// `admin` changes anything and controls the bot; `operator` may edit only its
+    /// own account's settings; `viewer` reads and changes nothing. An account not
+    /// listed here cannot log in at all, however good its signature.
+    pub access: BTreeMap<String, WebRole>,
+}
+
+impl Default for Web {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "127.0.0.1:8787".into(),
+            session_hours: 12,
+            allow_key_import: false,
+            access: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum WebRole {
+    Viewer,
+    Operator,
+    Admin,
+}
+
+impl WebRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WebRole::Viewer => "viewer",
+            WebRole::Operator => "operator",
+            WebRole::Admin => "admin",
+        }
+    }
+
+    /// Whether this role may see, or change, `account`. An operator is scoped to its
+    /// own account and nothing else; that scoping is the whole point of the role.
+    pub fn may_read(self, session_account: &str, account: &str) -> bool {
+        match self {
+            WebRole::Admin | WebRole::Viewer => true,
+            WebRole::Operator => session_account.eq_ignore_ascii_case(account),
+        }
+    }
+
+    pub fn may_write(self, session_account: &str, account: &str) -> bool {
+        match self {
+            WebRole::Admin => true,
+            WebRole::Operator => session_account.eq_ignore_ascii_case(account),
+            WebRole::Viewer => false,
+        }
+    }
+
+    /// Controlling the bot itself, and reading the cross-account log, is admin only.
+    pub fn is_admin(self) -> bool {
+        self == WebRole::Admin
+    }
+}
+
 /// One configured account with its fully merged settings.
 #[derive(Debug, Clone)]
 pub struct Account {
@@ -148,7 +223,7 @@ pub struct Account {
     pub settings: Settings,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Settings {
     pub attack: AttackSettings,
@@ -158,7 +233,7 @@ pub struct Settings {
     pub upgrade: UpgradeSettings,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct AttackSettings {
     pub enabled: bool,
@@ -199,7 +274,7 @@ impl Default for AttackSettings {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ClaimSettings {
     pub enabled: bool,
@@ -226,7 +301,7 @@ impl Default for ClaimSettings {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct QuestSettings {
     pub enabled: bool,
@@ -247,7 +322,7 @@ impl Default for QuestSettings {
 
 /// Boss fights burn FLUX through Hive-Engine, so they need an **active** key.
 /// Disabled unless both this flag and an active key in the wallet say otherwise.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct BossSettings {
     pub enabled: bool,
@@ -282,7 +357,7 @@ impl Default for BossSettings {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BossOrder {
     HighestLevel,
@@ -291,7 +366,7 @@ pub enum BossOrder {
 }
 
 /// Upgrades burn SCRAP through Hive-Engine, so they need an **active** key.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct UpgradeSettings {
     pub enabled: bool,
@@ -330,14 +405,14 @@ impl Default for UpgradeSettings {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UpgradeOrder {
     Cheapest,
     Listed,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Stat {
     Engineering,
@@ -374,7 +449,14 @@ impl Config {
         for key in table.keys() {
             if !matches!(
                 key.as_str(),
-                "general" | "hive" | "terracore" | "wallet" | "blacklist" | "defaults" | "accounts"
+                "general"
+                    | "hive"
+                    | "terracore"
+                    | "wallet"
+                    | "blacklist"
+                    | "web"
+                    | "defaults"
+                    | "accounts"
             ) {
                 bail!("unknown top-level section `{key}`");
             }
@@ -385,6 +467,10 @@ impl Config {
         let terracore: Terracore = section(table, "terracore")?;
         let wallet: WalletConfig = section(table, "wallet")?;
         let blacklist: Blacklist = section(table, "blacklist")?;
+        let web: Web = section(table, "web")?;
+        if web.enabled && web.access.is_empty() {
+            bail!("[web] is enabled but [web.access] names nobody, so nobody could log in");
+        }
 
         // Validated on its own first, so a typo in `[defaults]` is reported against
         // `[defaults]` rather than against whichever account inherited it.
@@ -443,6 +529,7 @@ impl Config {
             terracore,
             wallet,
             blacklist,
+            web,
             accounts: by_name.into_values().collect(),
             path: PathBuf::new(),
         })
@@ -452,6 +539,19 @@ impl Config {
     /// out of each other's target lists.
     pub fn account_names(&self) -> Vec<String> {
         self.accounts.iter().map(|a| a.name.clone()).collect()
+    }
+
+    /// The settings an account with no overrides at all ends up with. The web UI
+    /// hands back effective values; this is what they are diffed against so the file
+    /// keeps only what actually differs.
+    pub fn default_settings(path_text: &str) -> Result<Settings> {
+        let root: toml::Value = toml::from_str(path_text)?;
+        let defaults = root
+            .as_table()
+            .and_then(|t| t.get("defaults"))
+            .cloned()
+            .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
+        defaults.try_into().context("in section [defaults]")
     }
 
     pub fn wallet_path(&self) -> PathBuf {

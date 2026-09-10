@@ -9,7 +9,9 @@ mod config;
 mod hive;
 mod keys;
 mod runner;
+mod state;
 mod targeting;
+mod web;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,10 +20,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use hivecomb::keys::Role;
+use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
 use crate::runner::Bot;
+use crate::state::Shared;
 
 #[derive(Parser)]
 #[command(name = "terracore-bot", version, about, long_about = None)]
@@ -108,7 +113,10 @@ impl From<KeyRole> for Role {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    init_logging(cli.verbose);
+    // Created before logging so the log tee can write into it, and shared with the
+    // control panel if one starts.
+    let shared = Shared::new(2000);
+    init_logging(cli.verbose, Arc::clone(&shared));
 
     match &cli.command {
         Command::Wallet(command) => wallet(command, &cli),
@@ -120,13 +128,21 @@ fn main() -> Result<()> {
         }
         Command::Once => {
             let config = load_config(&cli)?;
-            let mut bot = Bot::new(config, stop_flag()?)?;
+            let mut bot = Bot::new(config, stop_flag()?, shared)?;
             bot.preflight()?;
             bot.cycle()
         }
         Command::Run => {
             let config = load_config(&cli)?;
-            let mut bot = Bot::new(config, stop_flag()?)?;
+            // Started before the first cycle so the panel is reachable while that
+            // cycle runs, rather than only after it.
+            if config.web.enabled {
+                let panel = web::spawn(&config, Arc::clone(&shared))?;
+                // Printed rather than only logged: with `bind = "…:0"` this is the
+                // only way to learn which port the OS handed out.
+                println!("Control panel: http://{}/", panel.addr);
+            }
+            let mut bot = Bot::new(config, stop_flag()?, shared)?;
             bot.preflight()?;
             bot.run()
         }
@@ -235,15 +251,68 @@ fn wallet(command: &WalletCommand, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn init_logging(verbose: u8) {
+fn init_logging(verbose: u8, shared: Arc<Shared>) {
     let default = match verbose {
         0 => "terracore_bot=info,warn",
         1 => "terracore_bot=debug,info",
         _ => "trace",
     };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
+
+    // Two sinks, one filter: the terminal keeps its colours, and the control panel
+    // gets the same lines without escape codes in them.
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(RingWriter(shared)),
+        )
         .init();
+}
+
+/// Tees formatted log lines into the in-memory ring the panel reads.
+#[derive(Clone)]
+struct RingWriter(Arc<Shared>);
+
+impl<'a> MakeWriter<'a> for RingWriter {
+    type Writer = RingLine;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        RingLine {
+            shared: Arc::clone(&self.0),
+            buffer: Vec::with_capacity(256),
+        }
+    }
+}
+
+/// One event's bytes, pushed into the ring when the layer drops the writer.
+struct RingLine {
+    shared: Arc<Shared>,
+    buffer: Vec<u8>,
+}
+
+impl std::io::Write for RingLine {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buffer.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for RingLine {
+    fn drop(&mut self) {
+        if self.buffer.is_empty() {
+            return;
+        }
+        let text = String::from_utf8_lossy(&self.buffer).trim_end().to_string();
+        if !text.is_empty() {
+            self.shared.log().push(text);
+        }
+    }
 }

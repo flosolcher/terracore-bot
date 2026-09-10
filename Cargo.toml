@@ -25,6 +25,12 @@ serde = { version = "1", features = ["derive"] }
 # The chain does not care, but a diff against the website's own payloads does.
 serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"
+# Rewrites the config in place, keeping comments and layout: the file stays the
+# source of truth and stays hand-editable after the UI has touched it.
+toml_edit = "0.22"
+# A blocking HTTP server. The bot has no async runtime and does not need one for a
+# loopback control panel; tiny_http keeps the whole binary synchronous.
+tiny_http = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time", "local-time"] }
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }

@@ -151,3 +151,31 @@ delay_secs = 10
 # enabled = true
 # stats = ["engineering", "damage"]
 # min_scrap_reserve = 5000.0
+
+# ---------------------------------------------------------------------------
+# The local control panel (optional)
+# ---------------------------------------------------------------------------
+# A small web UI for watching the bot and editing these settings. Login is Hive
+# Keychain: you sign a challenge with your posting key and the server checks the
+# recovered key against your posting authority on chain. No password is stored.
+#
+# Private keys are never entered here and never shown here. Import them with
+# `terracore-bot wallet import`.
+
+[web]
+enabled = false
+# Loopback. Anything else exposes a panel that can change what your accounts do,
+# so put a TLS reverse proxy in front of it if you must. Port 0 picks a free one
+# and the address is printed on start-up.
+bind = "127.0.0.1:8787"
+session_hours = 12
+
+# Who may log in, and as what. An account not listed here cannot log in at all,
+# however good its signature.
+#
+#   admin     everything: every account's settings, pause/resume, the log
+#   operator  its own account's settings only, and nothing else
+#   viewer    reads; changes nothing
+[web.access]
+# youraccount = "admin"
+# a-friend = "operator"
