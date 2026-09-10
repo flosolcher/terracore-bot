@@ -1,0 +1,9 @@
+/target
+# The encrypted wallet and anything that could hold a key. The encryption is the
+# plan; this is the backstop.
+*.wallet
+wallet.json
+*.wif
+.env
+# The live config: it names accounts and can hold a passphrase path.
+config.toml

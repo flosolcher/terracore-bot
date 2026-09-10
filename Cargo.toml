@@ -1,0 +1,36 @@
+[package]
+name = "terracore-bot"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "An automation daemon for the Terracore Hive game, signing offline with hivecomb."
+license = "MIT"
+
+[dependencies]
+# The signing and broadcast layer. `wallet` gives scrypt+AES-GCM key storage,
+# `ureq-transport` the blocking JSON-RPC client with node failover. Nothing else
+# is pulled in: no async runtime, and the signing path stays free of the network.
+hivecomb = { version = "0.1", default-features = false, features = [
+    "rpc",
+    "ureq-transport",
+    "wallet",
+] }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+# `preserve_order` so a custom_json payload serializes in the order it was built.
+# The chain does not care, but a diff against the website's own payloads does.
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "time", "local-time"] }
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+ctrlc = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
