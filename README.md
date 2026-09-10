@@ -72,6 +72,18 @@ cargo build --release
 ## Set up
 
 ```bash
+./setup.sh
+```
+
+It checks for Rust, builds, writes a `config.toml` for the account you name, creates
+the encrypted wallet, and offers to import your keys. It is safe to re-run: anything
+that already exists is left alone, because a wallet is not a file a setup script
+should have opinions about. Run it without a terminal and it does the parts that need
+no input and prints the rest as commands.
+
+Or by hand, which is all the script does:
+
+```bash
 cp config.example.toml config.toml
 $EDITOR config.toml            # add your account name under [accounts.…]
 
@@ -89,17 +101,24 @@ terracore-bot wallet import --account youraccount --role active
 Check what you have, then rehearse before you commit to anything:
 
 ```bash
-terracore-bot check            # the settings each account ends up with
-terracore-bot status           # live state, no passphrase needed, no broadcasts
-terracore-bot targets          # who it would attack right now, and why not the rest
-terracore-bot --dry-run once   # a full cycle: signs everything, broadcasts nothing
+./start.sh check               # the settings each account ends up with
+./start.sh status              # live state, no passphrase needed, no broadcasts
+./start.sh targets             # who it would attack right now, and why not the rest
+./start.sh --dry-run once      # a full cycle: signs everything, broadcasts nothing
 ```
 
 Then run it:
 
 ```bash
-terracore-bot run
+./start.sh                     # or: terracore-bot run
 ```
+
+`start.sh` rebuilds first if the binary is missing or older than `src/`, then hands
+over with `exec`, so Ctrl-C reaches the bot rather than a wrapper. Anything you pass
+goes straight through — `./start.sh status`, `./start.sh --dry-run once`.
+
+Both scripts read `TERRACORE_CONFIG` if you keep the config somewhere other than
+`./config.toml`.
 
 Ctrl-C stops after the action in flight rather than halfway through an attack run;
 press it twice to quit immediately.
@@ -262,6 +281,9 @@ against the live API.
 ## Layout
 
 ```
+setup.sh         first-time setup: config, wallet, keys
+start.sh         build if needed, then run
+
 src/
   main.rs        CLI
   config.rs      TOML, defaults + per-account overrides, deep-merged
