@@ -136,7 +136,7 @@ impl Runner<'_> {
         info!(
             account = self.account,
             scrap = %amount,
-            claims_left = player.claims as u32 - 1,
+            claims_left = (player.claims as u32).saturating_sub(1),
             trx = sent.trx_id(),
             dry_run = sent.was_dry_run(),
             "claimed",
@@ -161,6 +161,11 @@ impl Runner<'_> {
         }
 
         let mut player = player.clone();
+        // The game processes custom_json through a queue, so a re-read moments after
+        // an attack can still report the old count. Trusting it alone would attack
+        // more times than there are attacks; the budget seen at the start caps the
+        // run, and the re-read can only end it earlier.
+        let budget = player.attacks as u32;
         let mut attacked: HashSet<String> = HashSet::new();
         let mut board = Vec::new();
         let mut board_is_fresh = false;
@@ -198,6 +203,10 @@ impl Runner<'_> {
                 break;
             }
             if s.max_per_cycle > 0 && done >= s.max_per_cycle {
+                break;
+            }
+            if done >= budget {
+                debug!(account = self.account, budget, "the cycle's attack budget is spent");
                 break;
             }
 
@@ -262,12 +271,6 @@ impl Runner<'_> {
             // A dry run never changes anything on the server, so re-reading the
             // player would return the same numbers forever and loop.
             if self.hive.is_dry_run() {
-                if s.max_per_cycle == 0 && done as f64 >= player.attacks {
-                    break;
-                }
-                if s.max_per_cycle > 0 && done >= s.max_per_cycle {
-                    break;
-                }
                 continue;
             }
 

@@ -129,7 +129,7 @@ pub fn remove(path: &Path, passphrase_env: &str, public_key: &str) -> Result<boo
     wallet.unlock(&passphrase).context("unlocking the wallet")?;
     let public = hivecomb::PublicKey::from_prefixed(public_key, "STM")
         .context("that is not a valid STM public key")?;
-    Ok(wallet.remove_key(&public).context("removing the key")?)
+    wallet.remove_key(&public).context("removing the key")
 }
 
 pub fn list(path: &Path) -> Result<std::collections::BTreeMap<String, Vec<String>>> {

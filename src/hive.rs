@@ -140,7 +140,7 @@ impl Broadcaster {
         let transaction = Transaction::new(block_ref, vec![operation], self.expiration_secs)
             .context("building the transaction")?;
         let signed = transaction
-            .sign(&[key.clone()], Chain::Hive)
+            .sign(std::slice::from_ref(key), Chain::Hive)
             .context("signing the transaction")?;
         let trx_id = signed.transaction.id().context("computing the transaction id")?;
 
