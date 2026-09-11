@@ -15,10 +15,11 @@ use serde_json::json;
 use tracing::{debug, info, warn};
 
 use crate::api::{format_number, now_ms, Api, Player, Quest};
-use crate::config::{BossOrder, Settings, SpendSettings, Stat};
+use crate::config::{BossOrder, MissionOrder, Settings, SpendSettings, Stat};
 use crate::curves;
 use crate::hive::{tx_hash, Auth, Broadcaster};
 use crate::keys::AccountKeys;
+use crate::missions;
 use crate::targeting::{self, Context as TargetContext};
 
 /// Everything an action needs. Held per account for the length of one cycle.
@@ -341,6 +342,274 @@ impl Runner<'_> {
             );
             done += 1;
             self.wait(s.delay_secs);
+        }
+        Ok(Outcome::did(done))
+    }
+
+    /// Start missions from today's board.
+    ///
+    /// Burns SCRAP, so it needs an active key. The board resets daily and the game's
+    /// own client refuses to start anything from a stale copy -- the SCRAP would be
+    /// spent on a mission that no longer exists -- so that check comes first here too.
+    pub fn start_missions(&self, player: &Player) -> Result<Outcome> {
+        let s = &self.settings.quest;
+        if !s.enabled || !s.start {
+            return Ok(Outcome::skipped("starting missions is disabled"));
+        }
+        let active = match self.active_key("starting missions") {
+            Ok(key) => key,
+            Err(outcome) => return Ok(outcome),
+        };
+
+        let board = self
+            .api
+            .quest_board(self.account)
+            .context("fetching the mission board")?;
+        let today = missions::today_utc(now_ms());
+        if board.date != today {
+            return Ok(Outcome::skipped(format!(
+                "the board reads {} and today is {today}; it has not rolled over yet",
+                if board.date.is_empty() {
+                    "nothing"
+                } else {
+                    &board.date
+                }
+            )));
+        }
+        let running = self.api.quests(self.account).unwrap_or_default();
+
+        let mut spendable = (player.hive_engine_scrap - s.min_scrap_reserve).max(0.0);
+        let mut candidates: Vec<&crate::api::BoardSlot> = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
+
+        for slot in &board.slots {
+            let tier = slot.tier.round() as u8;
+            if tier < s.min_tier || tier > s.max_tier {
+                continue;
+            }
+            if !s.types.is_empty() && !s.types.iter().any(|t| t == &slot.quest_type) {
+                continue;
+            }
+            if s.max_scrap_per_mission > 0.0 && slot.scrap_cost > s.max_scrap_per_mission {
+                continue;
+            }
+            match missions::blocked(
+                slot,
+                &board.date,
+                &today,
+                player,
+                &player.items,
+                &running,
+                spendable,
+            ) {
+                None => candidates.push(slot),
+                Some(reason) => refused.push(format!(
+                    "t{tier} {}: {}",
+                    slot.quest_type,
+                    reason.describe()
+                )),
+            }
+        }
+
+        match s.order {
+            MissionOrder::HighestTier => candidates.sort_by(|a, b| {
+                b.tier
+                    .partial_cmp(&a.tier)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            MissionOrder::Cheapest => candidates.sort_by(|a, b| {
+                a.scrap_cost
+                    .partial_cmp(&b.scrap_cost)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            MissionOrder::BestValue => candidates.sort_by(|a, b| {
+                let value = |m: &crate::api::BoardSlot| {
+                    if m.scrap_cost > 0.0 {
+                        m.base_rolls / m.scrap_cost
+                    } else {
+                        f64::INFINITY
+                    }
+                };
+                value(b)
+                    .partial_cmp(&value(a))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+        }
+
+        if candidates.is_empty() {
+            return Ok(Outcome::skipped(if refused.is_empty() {
+                "no mission on the board matches the filters".to_string()
+            } else {
+                refused.join("; ")
+            }));
+        }
+
+        let mut done = 0;
+        for slot in candidates {
+            if self.stopping() {
+                break;
+            }
+            if s.max_starts_per_cycle > 0 && done >= s.max_starts_per_cycle {
+                break;
+            }
+            if slot.scrap_cost > spendable {
+                continue;
+            }
+            let memo = format!(
+                "terracore_quest_start-{}-{}-{}",
+                slot.quest_type,
+                slot.tier.round() as u8,
+                tx_hash()
+            );
+            let sent = self.hive.engine_transfer(
+                self.account,
+                active,
+                "SCRAP",
+                "null",
+                &format_number(slot.scrap_cost),
+                json!(memo),
+            )?;
+            info!(
+                account = self.account,
+                mission = %slot.name,
+                kind = %slot.quest_type,
+                tier = slot.tier,
+                cost = format!("{:.0}", slot.scrap_cost),
+                hours = slot.duration_hours,
+                trx = sent.trx_id(),
+                dry_run = sent.was_dry_run(),
+                "started mission",
+            );
+            spendable -= slot.scrap_cost;
+            done += 1;
+            self.wait(s.delay_secs);
+        }
+        Ok(Outcome::did(done))
+    }
+
+    /// Open crates. Free, and a posting key is enough.
+    pub fn open_crates(&self) -> Result<Outcome> {
+        let s = &self.settings.crates;
+        if !s.enabled {
+            return Ok(Outcome::skipped("opening crates is disabled"));
+        }
+        let inventory = self
+            .api
+            .inventory(self.account)
+            .context("reading the inventory")?;
+        let wanted: Vec<&crate::api::Crate> = inventory
+            .crates
+            .iter()
+            .filter(|c| s.rarities.is_empty() || s.rarities.iter().any(|r| r == &c.rarity))
+            .collect();
+        if wanted.is_empty() {
+            return Ok(Outcome::skipped(format!(
+                "no crate to open ({} held)",
+                inventory.crates.len()
+            )));
+        }
+
+        let mut done = 0;
+        for crate_ in wanted {
+            if self.stopping() || (s.max_per_cycle > 0 && done >= s.max_per_cycle) {
+                break;
+            }
+            let sent = self.hive.custom_json(
+                self.account,
+                &self.keys.posting,
+                Auth::Posting,
+                "terracore_open_crate",
+                json!({ "crate_type": crate_.rarity, "owner": self.account }),
+            )?;
+            info!(
+                account = self.account,
+                rarity = %crate_.rarity,
+                trx = sent.trx_id(),
+                dry_run = sent.was_dry_run(),
+                "opened crate",
+            );
+            done += 1;
+            self.wait(s.delay_secs);
+        }
+        Ok(Outcome::did(done))
+    }
+
+    /// Use consumables, but only where one would unblock something right now.
+    ///
+    /// An attack potion drunk with attacks already in hand is thrown away, so the
+    /// condition matters more than the inventory: the bot spends a charge only when
+    /// the thing it grants is the thing currently missing.
+    pub fn use_consumables(&self, player: &Player) -> Result<Outcome> {
+        let s = &self.settings.consumables;
+        if !s.enabled {
+            return Ok(Outcome::skipped("consumables are disabled"));
+        }
+        let inventory = self
+            .api
+            .inventory(self.account)
+            .context("reading the inventory")?;
+
+        // What is actually blocked at this moment.
+        let out_of_attacks = player.attacks < 1.0;
+        let out_of_claims = player.claims < 1.0;
+        let stash_full = player.stash_is_full();
+        let could_use_attacks = out_of_attacks && !stash_full && player.claims >= 1.0;
+        let could_use_claims = out_of_claims && player.scrap >= self.settings.claim.min_scrap;
+
+        let mut done = 0;
+        let mut skipped: Vec<String> = Vec::new();
+
+        for item in &inventory.consumables {
+            if self.stopping() || (s.max_per_cycle > 0 && done >= s.max_per_cycle) {
+                break;
+            }
+            let kind = item.short_name().to_string();
+            if item.amount < 1.0 || !s.use_kinds.iter().any(|k| k == &kind) {
+                continue;
+            }
+            let unblocks = match kind.as_str() {
+                "attack" | "fury" => could_use_attacks,
+                "claim" => could_use_claims,
+                // Everything else is a timed buff. Burning one on a schedule wastes
+                // most of it, so the bot leaves those to you.
+                _ => false,
+            };
+            if !unblocks {
+                skipped.push(format!("{kind} would be wasted right now"));
+                continue;
+            }
+
+            let sent = self.hive.custom_json(
+                self.account,
+                &self.keys.posting,
+                Auth::Posting,
+                "terracore_use_consumable",
+                json!({
+                    "action": format!("terracore_use_consumable-{}", tx_hash()),
+                    "type": item.kind,
+                }),
+            )?;
+            info!(
+                account = self.account,
+                consumable = %item.kind,
+                held = item.amount,
+                trx = sent.trx_id(),
+                dry_run = sent.was_dry_run(),
+                "used consumable",
+            );
+            done += 1;
+            self.wait(s.delay_secs);
+        }
+
+        if done == 0 {
+            return Ok(Outcome::skipped(if skipped.is_empty() {
+                format!(
+                    "nothing usable held ({} consumables)",
+                    inventory.consumables.len()
+                )
+            } else {
+                skipped.join("; ")
+            }));
         }
         Ok(Outcome::did(done))
     }

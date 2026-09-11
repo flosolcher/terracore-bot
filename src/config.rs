@@ -226,6 +226,8 @@ pub struct Settings {
     pub quest: QuestSettings,
     pub boss: BossSettings,
     pub spend: SpendSettings,
+    pub crates: CrateSettings,
+    pub consumables: ConsumableSettings,
 }
 
 impl Settings {
@@ -244,6 +246,15 @@ impl Settings {
         if self.quest.enabled && self.quest.collect {
             actions.push("quests");
         }
+        if self.quest.enabled && self.quest.start {
+            actions.push("missions");
+        }
+        if self.consumables.enabled {
+            actions.push("consumables");
+        }
+        if self.crates.enabled {
+            actions.push("crates");
+        }
         if self.spend.enabled {
             actions.push("spend");
         }
@@ -256,7 +267,7 @@ impl Settings {
     /// Whether anything enabled here moves Hive-Engine tokens, and so cannot run
     /// without an active key in the wallet.
     pub fn needs_active_key(&self) -> bool {
-        self.boss.enabled || self.spend.enabled
+        self.boss.enabled || self.spend.enabled || (self.quest.enabled && self.quest.start)
     }
 }
 
@@ -334,6 +345,25 @@ pub struct QuestSettings {
     pub enabled: bool,
     /// Collect finished missions. Free: it only harvests rewards.
     pub collect: bool,
+    /// Start missions from the daily board. This **burns SCRAP** and so needs an
+    /// active key, which is why it is separate from `collect` and off by default.
+    pub start: bool,
+    /// Tiers to consider. The game gates tiers on level, on the mission's own stat,
+    /// and from tier 3 up on having the matching gear equipped.
+    pub min_tier: u8,
+    pub max_tier: u8,
+    /// Mission types to consider: combat, salvage, stealth, fortune, defense.
+    /// Empty means all of them.
+    pub types: Vec<String>,
+    /// Refuse any mission costing more than this. 0 disables the cap.
+    pub max_scrap_per_mission: f64,
+    /// Never spend liquid SCRAP below this on missions.
+    pub min_scrap_reserve: f64,
+    /// Missions started per cycle. 0 means as many as qualify.
+    pub max_starts_per_cycle: u32,
+    /// `highest_tier` prefers the best drops, `cheapest` the smallest outlay,
+    /// `best_value` the most reward rolls per SCRAP.
+    pub order: MissionOrder,
     pub delay_secs: u64,
 }
 
@@ -342,6 +372,72 @@ impl Default for QuestSettings {
         Self {
             enabled: true,
             collect: true,
+            start: false,
+            min_tier: 1,
+            max_tier: 5,
+            types: Vec::new(),
+            max_scrap_per_mission: 0.0,
+            min_scrap_reserve: 0.0,
+            max_starts_per_cycle: 0,
+            order: MissionOrder::HighestTier,
+            delay_secs: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionOrder {
+    HighestTier,
+    Cheapest,
+    BestValue,
+}
+
+/// Opening crates costs nothing and needs only a posting key. Off by default all
+/// the same: an unopened crate can be sold, and opening one is irreversible.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CrateSettings {
+    pub enabled: bool,
+    /// Rarities to open. Empty means all of them.
+    pub rarities: Vec<String>,
+    pub max_per_cycle: u32,
+    pub delay_secs: u64,
+}
+
+impl Default for CrateSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rarities: Vec::new(),
+            max_per_cycle: 0,
+            delay_secs: 5,
+        }
+    }
+}
+
+/// Consumables are spent with a posting key and cost nothing to use.
+///
+/// The bot only ever uses one when it would unblock something *right now* -- an
+/// attack potion with attacks already in hand is thrown away, and a 24-hour buff
+/// burned at 3am is mostly wasted.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConsumableSettings {
+    pub enabled: bool,
+    /// Which to use, by their short name: `attack`, `fury`, `claim`. Buffs such as
+    /// `crit`, `damage`, `rage` are not used on a schedule and are ignored here.
+    pub use_kinds: Vec<String>,
+    pub max_per_cycle: u32,
+    pub delay_secs: u64,
+}
+
+impl Default for ConsumableSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            use_kinds: vec!["fury".into(), "attack".into(), "claim".into()],
+            max_per_cycle: 2,
             delay_secs: 5,
         }
     }
@@ -844,6 +940,56 @@ max_enemy_dodge = 5.0
         // And it is a config the bot would actually accept.
         let loadable = example.replace("[accounts.youraccount]", "[accounts.probe]");
         Config::from_str(&loadable).expect("the shipped example must load");
+    }
+
+    /// The test above compares *values*, which a missing key passes trivially --
+    /// serde fills it from the compiled default and the two agree. So it could not
+    /// notice a setting the example never mentions, and three whole sections were
+    /// added without being documented. This one walks every leaf the settings
+    /// serialize to and insists the example names it.
+    #[test]
+    fn every_setting_is_documented_in_the_example() {
+        let example = include_str!("../config.example.toml");
+        let root: toml::Value = toml::from_str(example).expect("the example must parse");
+        let documented = root
+            .get("defaults")
+            .expect("[defaults] must exist in the example");
+
+        let mut missing = Vec::new();
+        walk(
+            &toml::Value::try_from(Settings::default()).unwrap(),
+            documented,
+            &mut Vec::new(),
+            &mut missing,
+        );
+        assert!(
+            missing.is_empty(),
+            "config.example.toml does not document: {}",
+            missing.join(", ")
+        );
+    }
+
+    fn walk(
+        expected: &toml::Value,
+        actual: &toml::Value,
+        path: &mut Vec<String>,
+        missing: &mut Vec<String>,
+    ) {
+        let Some(table) = expected.as_table() else {
+            return;
+        };
+        for (key, value) in table {
+            path.push(key.clone());
+            match actual.get(key) {
+                None => missing.push(path.join(".")),
+                Some(found) => {
+                    if value.is_table() {
+                        walk(value, found, path, missing);
+                    }
+                }
+            }
+            path.pop();
+        }
     }
 
     #[test]

@@ -9,6 +9,7 @@ mod config;
 mod curves;
 mod hive;
 mod keys;
+mod missions;
 mod recommend;
 mod runner;
 mod state;
@@ -57,6 +58,11 @@ enum Command {
     Once,
     /// Show what the bot sees for each account. Reads only.
     Status,
+    /// Show today's mission board and what could be started, with reasons.
+    Missions {
+        /// Limit to one account.
+        account: Option<String>,
+    },
     /// Suggest spending settings from an account's own numbers.
     Recommend {
         /// Limit to one account.
@@ -133,6 +139,7 @@ fn main() -> Result<()> {
         Command::Check => check(&cli),
         // No wallet, no passphrase, no broadcasts: safe to run anywhere.
         Command::Status => runner::status(&load_config(&cli)?),
+        Command::Missions { account } => missions_command(&load_config(&cli)?, account.as_deref()),
         Command::Recommend { account, apply } => {
             recommend_command(&load_config(&cli)?, account.as_deref(), *apply)
         }
@@ -235,6 +242,64 @@ fn check(cli: &Cli) -> Result<()> {
         println!("  quest    {:?}", s.quest);
         println!("  boss     {:?}", s.boss);
         println!("  spend    {:?}", s.spend);
+        println!();
+    }
+    Ok(())
+}
+
+/// Today's board, and why each mission can or cannot be started. Reads only.
+fn missions_command(config: &Config, only: Option<&str>) -> Result<()> {
+    let api = crate::api::Api::new(
+        &config.terracore.api,
+        std::time::Duration::from_secs(config.terracore.timeout_secs),
+        config.terracore.retries,
+    );
+    let today = crate::missions::today_utc(crate::api::now_ms());
+
+    for account in &config.accounts {
+        if only.is_some_and(|want| !want.eq_ignore_ascii_case(&account.name)) {
+            continue;
+        }
+        let player = match api.player(&account.name) {
+            Ok(player) => player,
+            Err(e) => {
+                println!("@{}  unreachable: {e:#}\n", account.name);
+                continue;
+            }
+        };
+        let board = api.quest_board(&account.name)?;
+        let running = api.quests(&account.name).unwrap_or_default();
+        let s = &account.settings.quest;
+        let spendable = (player.hive_engine_scrap - s.min_scrap_reserve).max(0.0);
+
+        println!(
+            "@{}  level {:.0}, {:.0} liquid SCRAP -- board for {} (today is {})",
+            account.name, player.level, player.hive_engine_scrap, board.date, today
+        );
+        for slot in &board.slots {
+            let verdict = match crate::missions::blocked(
+                slot,
+                &board.date,
+                &today,
+                &player,
+                &player.items,
+                &running,
+                spendable,
+            ) {
+                None => "CAN START".to_string(),
+                Some(reason) => reason.describe(),
+            };
+            println!(
+                "  t{} {:<8} {:>7.0} SCRAP  {:>3.0}h  {:>2.0} rolls   {:<22} {}",
+                slot.tier,
+                slot.quest_type,
+                slot.scrap_cost,
+                slot.duration_hours,
+                slot.base_rolls,
+                verdict,
+                slot.name
+            );
+        }
         println!();
     }
     Ok(())

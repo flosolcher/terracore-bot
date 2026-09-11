@@ -306,6 +306,23 @@ impl Bot {
             Err(e) => self.note_failure("quests", &account.name, &e, &mut report),
         }
 
+        // Consumables before the rest: one of them may hand back the attacks or the
+        // claim that the actions after it are waiting on.
+        match runner.use_consumables(&player) {
+            Ok(outcome) => self.note("consumables", &account.name, &outcome, &mut report),
+            Err(e) => self.note_failure("consumables", &account.name, &e, &mut report),
+        }
+
+        match runner.open_crates() {
+            Ok(outcome) => self.note("crates", &account.name, &outcome, &mut report),
+            Err(e) => self.note_failure("crates", &account.name, &e, &mut report),
+        }
+
+        match runner.start_missions(&player) {
+            Ok(outcome) => self.note("missions", &account.name, &outcome, &mut report),
+            Err(e) => self.note_failure("missions", &account.name, &e, &mut report),
+        }
+
         match runner.spend(&player) {
             Ok(outcome) => self.note("spend", &account.name, &outcome, &mut report),
             Err(e) => self.note_failure("spend", &account.name, &e, &mut report),

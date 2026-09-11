@@ -91,9 +91,49 @@ cooldown_secs = 30
 
 [defaults.quest]
 enabled = true
-# Collect finished missions. This only harvests rewards; it never starts a
-# mission, which would cost SCRAP.
+# Collect finished missions. Free -- it only harvests rewards.
 collect = true
+delay_secs = 5
+
+# --- Starting missions BURNS SCRAP and needs an ACTIVE key. ------------------
+# The game gates each tier on your level, on the mission's own stat, and from
+# tier 3 up on having the matching gear equipped. `terracore-bot missions` shows
+# today's board and says exactly which of those you fail, if any.
+start = false
+min_tier = 1
+max_tier = 5
+# combat, salvage, stealth, fortune, defense. Empty means all of them.
+types = []
+# Refuse a mission costing more than this. 0 disables the cap.
+max_scrap_per_mission = 0.0
+# Never spend liquid SCRAP below this on missions.
+min_scrap_reserve = 0.0
+# 0 means start as many as qualify.
+max_starts_per_cycle = 0
+# highest_tier | cheapest | best_value
+# The game prices every tier at roughly the same reward per SCRAP, so the real
+# difference is drop rarity and duration -- which is why the default prefers the
+# highest tier you can reach rather than the cheapest.
+order = "highest_tier"
+
+[defaults.crates]
+# Opening a crate is free and needs only a posting key. Off by default anyway:
+# an unopened crate can be sold, and opening one cannot be undone.
+enabled = false
+# Rarities to open. Empty means all of them.
+rarities = []
+max_per_cycle = 0
+delay_secs = 5
+
+[defaults.consumables]
+# Spent with a posting key, and free to use. The bot only ever uses one when it
+# would unblock something right now -- an attack potion drunk with attacks
+# already in hand is thrown away, and a 24-hour buff burned at 3am is mostly
+# wasted, so timed buffs are left to you entirely.
+enabled = false
+# Short names: attack (+1 attack), fury (+4 attacks), claim (+1 claim).
+use_kinds = ["fury", "attack", "claim"]
+max_per_cycle = 2
 delay_secs = 5
 
 # --- The two below move Hive-Engine tokens and need an ACTIVE key. -----------

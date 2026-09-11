@@ -87,6 +87,17 @@ pub struct Item {
     pub item_id: Option<i64>,
     #[serde(default)]
     pub item_equipped: bool,
+    /// What this piece contributes. Mission requirements are computed from these,
+    /// not from the player's effective stats.
+    #[serde(default)]
+    pub attributes: Stats,
+}
+
+impl Item {
+    /// Whether something is actually equipped in this slot.
+    pub fn equipped(&self) -> bool {
+        self.item_number.is_some_and(|n| n >= 0)
+    }
 }
 
 #[allow(dead_code)]
@@ -102,6 +113,30 @@ pub struct Items {
     pub ship: Item,
     #[serde(default)]
     pub special: Item,
+}
+
+impl Items {
+    /// The item occupying one slot, by the name the game uses.
+    pub fn slot(&self, name: &str) -> &Item {
+        match name {
+            "weapon" => &self.weapon,
+            "armor" => &self.armor,
+            "ship" => &self.ship,
+            "special" => &self.special,
+            _ => &self.avatar,
+        }
+    }
+
+    /// Every slot, for the requirements that sum across all equipped gear.
+    pub fn all(&self) -> [&Item; 5] {
+        [
+            &self.avatar,
+            &self.weapon,
+            &self.armor,
+            &self.ship,
+            &self.special,
+        ]
+    }
 }
 
 /// The bot's own account state.
@@ -278,6 +313,71 @@ impl PlanetsResponse {
     }
 }
 
+/// One mission offered on today's board.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BoardSlot {
+    #[serde(default)]
+    pub template_id: String,
+    #[serde(default)]
+    pub quest_type: String,
+    #[serde(default)]
+    pub tier: f64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub duration_hours: f64,
+    #[serde(default)]
+    pub base_rolls: f64,
+    #[serde(default)]
+    pub scrap_cost: f64,
+}
+
+/// The board, and the day it belongs to.
+///
+/// The date matters: the board rolls over daily, and the game's own client refuses
+/// to start anything from a stale one because the SCRAP would be burned for a
+/// mission that no longer exists.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct QuestBoard {
+    #[serde(default)]
+    pub date: String,
+    #[serde(default)]
+    pub slots: Vec<BoardSlot>,
+}
+
+/// A crate waiting to be opened. Opening is free and needs only a posting key.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Crate {
+    #[serde(default)]
+    pub rarity: String,
+}
+
+/// A consumable held in inventory. `kind` is the leading word of `type`, which is
+/// what the rest of the game calls it: `fury_consumable` is the `fury` potion.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Consumable {
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub amount: f64,
+}
+
+impl Consumable {
+    pub fn short_name(&self) -> &str {
+        self.kind.split('_').next().unwrap_or(&self.kind)
+    }
+}
+
+/// Everything `/items/<player>` returns.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Inventory {
+    #[serde(default)]
+    pub crates: Vec<Crate>,
+    #[serde(default)]
+    pub consumables: Vec<Consumable>,
+}
+
 /// An accepted mission. `completes_at` is when its rewards become collectable.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -404,6 +504,16 @@ impl Api {
             Ok(_) => Ok(Vec::new()),
             Err(e) => Err(e),
         }
+    }
+
+    /// Today's mission board for this account.
+    pub fn quest_board(&self, name: &str) -> Result<QuestBoard> {
+        self.get("/quest_board", &[("username", name.to_string())])
+    }
+
+    /// Crates and consumables held.
+    pub fn inventory(&self, name: &str) -> Result<Inventory> {
+        self.get(&format!("/items/{name}"), &[])
     }
 
     /// How many game transactions are queued for processing. A long queue means the

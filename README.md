@@ -31,7 +31,10 @@ This is a fresh implementation. Nothing was carried over but the idea.
 |---|---|---|
 | **Attack** | posting key | Picks targets with the game client's own rules and ranking. |
 | **Claim** | posting key | Empties the stash into your Hive-Engine balance. |
-| **Missions** | posting key | Collects finished missions. Never *starts* one — that costs SCRAP. |
+| **Missions** | posting key | Collects finished missions. |
+| **Start missions** | **active key** | Starts them from the daily board. Burns SCRAP. Off by default. |
+| **Crates** | posting key | Opens crates you hold. Free, but irreversible, so off by default. |
+| **Consumables** | posting key | Uses one only when it unblocks something now. Off by default. |
 | **Boss fights** | **active key** | Burns FLUX per fight, four-hour cooldown per planet. Off by default. |
 | **Spending** | **active key** | Turns surplus SCRAP into stats, crit and stake, rotating between them. Off by default. |
 
@@ -353,6 +356,7 @@ src/
   api.rs         the Terracore REST API and its shapes
   targeting.rs   who to attack, and why not the rest  (pure, tested)
   curves.rs      the game's stat formulas and what the next point costs (pure, tested)
+  missions.rs    whether a mission can be started, and why not (pure, tested)
   hive.rs        custom_json construction, signing, broadcast
   keys.rs        the encrypted wallet
   actions.rs     attack, claim, missions, boss, upgrade
@@ -369,15 +373,33 @@ src/
 cargo test        # the rules ported from the client are the part worth testing
 ```
 
+## Missions
+
+The board rolls over daily and each mission is gated three ways — your level, the
+mission's own stat, and from tier 3 up the matching gear slot. `terracore-bot
+missions` shows today's board and names exactly which gate you fail:
+
+```
+@noctury  level 33, 14743 liquid SCRAP -- board for 2026-09-11 (today is 2026-09-11)
+  t2 defense      641 SCRAP    4h   3 rolls   CAN START            Hold: Docking Bay Seven
+  t3 stealth     1506 SCRAP   12h   4 rolls   needs dodge of 12    Op: Phantom Protocol
+  t4 combat      6310 SCRAP   24h   6 rolls   needs level 50       Raid: The Obsidian Vault
+```
+
+Two details are the game's, not mine, and both are ported exactly: the stat for
+`stealth` and `fortune` missions is summed from **item attributes only** — the dodge
+you get for staking does not count — while every other type adds the matching slot on
+top of your effective stat. And a board from yesterday is refused outright, because
+starting from a stale copy burns the SCRAP on a mission that no longer exists.
+
 ## Not done yet
 
-- Starting missions (as opposed to collecting them) and opening crates, both of which
-  spend SCRAP.
-- Using consumables — `fury` for four more attacks, `focus` to reach a target above
-  your damage — which the bot understands but never spends.
-- The mission model is read from the game client rather than confirmed against live
-  data: no account checked had a mission in flight. A shape mismatch means "nothing to
-  collect", not a crash.
+- Buying and selling on the marketplace, and forging or salvaging items.
+- Timed buff consumables (`crit`, `damage`, `rage`, `protection`) are deliberately
+  left alone: burning a 24-hour buff on a schedule wastes most of it.
+- The `focus` consumable is understood by the targeting code but never spent.
+- Mission *collection* has still not been seen against live data — no account checked
+  had one finish. A shape mismatch means "nothing to collect", not a crash.
 
 ## Credit
 
