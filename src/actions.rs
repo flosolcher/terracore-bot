@@ -33,6 +33,9 @@ pub struct Runner<'a> {
     /// Set by Ctrl-C. Checked before every broadcast and during every sleep, so a
     /// stop lands between actions rather than in the middle of one.
     pub stop: Arc<AtomicBool>,
+    /// Missions this process has already started today. The game's own record lags
+    /// behind by a queue, so this is what stops a second cycle paying twice.
+    pub started_missions: Arc<std::sync::Mutex<HashSet<missions::MissionKey>>>,
 }
 
 /// What one action did, for the cycle summary.
@@ -396,14 +399,28 @@ impl Runner<'_> {
         let running = self.api.quests(self.account).unwrap_or_default();
 
         let mut spendable = (player.hive_engine_scrap - s.min_scrap_reserve).max(0.0);
+        let already = {
+            let mut set = self
+                .started_missions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // Keyed by day, so yesterday's entries can never match today's board.
+            // Dropping them keeps this from growing for the life of the process --
+            // five types across five tiers every day adds up over a few months.
+            set.retain(|(date, _, _)| date == &today);
+            set.clone()
+        };
         let (candidates, refused) = missions::select(
             &board,
-            &today,
-            player,
-            &player.items,
-            &running,
-            s,
-            spendable,
+            &missions::Context {
+                today: &today,
+                player,
+                items: &player.items,
+                running: &running,
+                settings: s,
+                spendable,
+                already_started: &already,
+            },
         );
 
         if candidates.is_empty() {
@@ -451,6 +468,10 @@ impl Runner<'_> {
                 dry_run = sent.was_dry_run(),
                 "started mission",
             );
+            self.started_missions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(missions::key_for(&board.date, slot));
             spendable -= slot.scrap_cost;
             committed += slot.scrap_cost;
             done += 1;
@@ -930,6 +951,7 @@ mod tests {
                 settings: &$settings,
                 blacklist: &$blacklist,
                 stop: Arc::new(AtomicBool::new(false)),
+                started_missions: Arc::new(std::sync::Mutex::new(HashSet::new())),
             }
         };
     }
@@ -1841,6 +1863,7 @@ mod consumable_tests {
             settings,
             blacklist,
             stop: Arc::new(AtomicBool::new(false)),
+            started_missions: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 

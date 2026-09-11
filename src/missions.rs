@@ -6,7 +6,21 @@
 //! not already running, your level clears the tier, the relevant stat clears the
 //! tier, and from tier 3 up the matching gear slot is filled.
 
+use std::collections::HashSet;
+
 use crate::api::{BoardSlot, Items, Player, Quest};
+
+/// Identifies one mission for the day: the game allows a given type and tier once
+/// per board, so this is the natural key for "already dealt with".
+pub type MissionKey = (String, String, u8);
+
+pub fn key_for(date: &str, slot: &BoardSlot) -> MissionKey {
+    (
+        date.to_string(),
+        slot.quest_type.clone(),
+        slot.tier.round() as u8,
+    )
+}
 
 /// Minimum player level per tier.
 const LEVEL_FOR_TIER: [(u8, f64); 5] = [(1, 1.0), (2, 10.0), (3, 25.0), (4, 50.0), (5, 100.0)];
@@ -223,6 +237,21 @@ pub fn blocked(
     None
 }
 
+/// Everything a mission decision depends on, gathered so the rule itself stays
+/// testable without a network or a clock -- the same shape the targeting module uses.
+pub struct Context<'a> {
+    pub today: &'a str,
+    pub player: &'a Player,
+    pub items: &'a Items,
+    pub running: &'a [Quest],
+    pub settings: &'a crate::config::QuestSettings,
+    /// Liquid SCRAP genuinely available: the caller has already taken off any
+    /// reserve, so this does not need to know about one.
+    pub spendable: f64,
+    /// Missions this process has already started today.
+    pub already_started: &'a HashSet<MissionKey>,
+}
+
 /// The board slots worth starting, best first, plus why each of the rest was not.
 ///
 /// Everything the choice depends on lives here rather than in the action: the
@@ -231,13 +260,18 @@ pub fn blocked(
 /// cost cap changed nothing any test could see.
 pub fn select<'a>(
     board: &'a crate::api::QuestBoard,
-    today: &str,
-    player: &Player,
-    items: &Items,
-    running: &[Quest],
-    s: &crate::config::QuestSettings,
-    spendable: f64,
+    ctx: &Context<'_>,
 ) -> (Vec<&'a BoardSlot>, Vec<String>) {
+    let Context {
+        today,
+        player,
+        items,
+        running,
+        settings: s,
+        spendable,
+        already_started,
+    } = ctx;
+    let spendable = *spendable;
     let mut candidates: Vec<&BoardSlot> = Vec::new();
     let mut refused: Vec<String> = Vec::new();
 
@@ -253,6 +287,17 @@ pub fn select<'a>(
             refused.push(format!(
                 "t{tier} {}: costs {:.0}, over max_scrap_per_mission",
                 slot.quest_type, slot.scrap_cost
+            ));
+            continue;
+        }
+        // The game queues these, so `running` can still be empty seconds after a
+        // start went out. Without a memory of what this process already sent, a
+        // second cycle -- a "run now" from the panel, say -- would start the same
+        // mission again and burn the cost twice.
+        if already_started.contains(&key_for(&board.date, slot)) {
+            refused.push(format!(
+                "t{tier} {}: already started by this run today",
+                slot.quest_type
             ));
             continue;
         }
@@ -660,6 +705,23 @@ mod selection_tests {
         s
     }
 
+    fn ctx<'a>(
+        s: &'a QuestSettings,
+        player: &'a Player,
+        items: &'a Items,
+        already: &'a std::collections::HashSet<MissionKey>,
+    ) -> Context<'a> {
+        Context {
+            today: TODAY,
+            player,
+            items,
+            running: &[],
+            settings: s,
+            spendable: 1e9,
+            already_started: already,
+        }
+    }
+
     fn names(picked: &[&BoardSlot]) -> Vec<String> {
         picked.iter().map(|s| s.name.clone()).collect()
     }
@@ -674,7 +736,7 @@ mod selection_tests {
         let mut s = settings();
         s.min_tier = 2;
         s.max_tier = 4;
-        let (picked, _) = select(&b, TODAY, &strong(), &geared(), &[], &s, 1e9);
+        let (picked, _) = select(&b, &ctx(&s, &strong(), &geared(), &HashSet::new()));
         assert_eq!(names(&picked), ["t3 combat"], "only tier 3 is inside 2..=4");
     }
 
@@ -683,7 +745,7 @@ mod selection_tests {
         let b = board(&[("combat", 1.0, 100.0, 2.0), ("combat", 1.0, 5000.0, 2.0)]);
         let mut s = settings();
         s.max_scrap_per_mission = 1000.0;
-        let (picked, refused) = select(&b, TODAY, &strong(), &geared(), &[], &s, 1e9);
+        let (picked, refused) = select(&b, &ctx(&s, &strong(), &geared(), &HashSet::new()));
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].scrap_cost, 100.0);
         assert!(
@@ -697,7 +759,7 @@ mod selection_tests {
         let b = board(&[("combat", 1.0, 10.0, 2.0), ("salvage", 1.0, 10.0, 2.0)]);
         let mut s = settings();
         s.types = vec!["salvage".into()];
-        let (picked, _) = select(&b, TODAY, &strong(), &geared(), &[], &s, 1e9);
+        let (picked, _) = select(&b, &ctx(&s, &strong(), &geared(), &HashSet::new()));
         assert_eq!(names(&picked), ["t1 salvage"]);
     }
 
@@ -712,16 +774,67 @@ mod selection_tests {
         let mut s = settings();
 
         s.order = MissionOrder::Cheapest;
-        let (picked, _) = select(&b, TODAY, &strong(), &geared(), &[], &s, 1e9);
+        let (picked, _) = select(&b, &ctx(&s, &strong(), &geared(), &HashSet::new()));
         assert_eq!(picked[0].scrap_cost, 100.0, "cheapest first");
 
         s.order = MissionOrder::HighestTier;
-        let (picked, _) = select(&b, TODAY, &strong(), &geared(), &[], &s, 1e9);
+        let (picked, _) = select(&b, &ctx(&s, &strong(), &geared(), &HashSet::new()));
         assert_eq!(picked[0].tier, 5.0, "highest tier first");
 
         s.order = MissionOrder::BestValue;
-        let (picked, _) = select(&b, TODAY, &strong(), &geared(), &[], &s, 1e9);
+        let (picked, _) = select(&b, &ctx(&s, &strong(), &geared(), &HashSet::new()));
         assert_eq!(picked[0].base_rolls, 9.0, "most rolls per SCRAP first");
+    }
+
+    #[test]
+    fn a_mission_this_run_already_started_is_not_paid_for_twice() {
+        // The game records a start through a queue, so for a minute afterwards its
+        // own answer still says nothing is running. Without this memory a second
+        // cycle -- a "run now" from the panel -- pays the cost again.
+        let b = board(&[("combat", 1.0, 641.0, 2.0)]);
+        let s = settings();
+
+        let (picked, _) = select(&b, &ctx(&s, &strong(), &geared(), &HashSet::new()));
+        assert_eq!(picked.len(), 1, "it should be startable to begin with");
+
+        let mut started = HashSet::new();
+        started.insert(key_for(TODAY, picked[0]));
+        let (picked, refused) = select(&b, &ctx(&s, &strong(), &geared(), &started));
+        assert!(picked.is_empty(), "{picked:?}");
+        assert!(refused[0].contains("already started"), "{refused:?}");
+    }
+
+    #[test]
+    fn the_memory_is_keyed_to_the_day_so_it_clears_at_the_rollover() {
+        let b = board(&[("combat", 1.0, 641.0, 2.0)]);
+        let s = settings();
+        let mut started = HashSet::new();
+        started.insert(("2026-09-10".to_string(), "combat".to_string(), 1u8));
+
+        // Yesterday's record must not block today's board.
+        let (picked, _) = select(&b, &ctx(&s, &strong(), &geared(), &started));
+        assert_eq!(picked.len(), 1, "a stale day must not block a fresh board");
+    }
+
+    #[test]
+    fn the_started_memory_does_not_grow_without_bound() {
+        // The action prunes to the current day before use. This checks the property
+        // that makes that safe: a key is only ever relevant to its own date, so
+        // dropping the others cannot change any decision.
+        let mut set: std::collections::HashSet<MissionKey> = std::collections::HashSet::new();
+        for day in 1..=28 {
+            set.insert((format!("2026-08-{day:02}"), "combat".into(), 1));
+        }
+        set.insert((TODAY.to_string(), "combat".into(), 1));
+        assert_eq!(set.len(), 29);
+
+        set.retain(|(date, _, _)| date == TODAY);
+        assert_eq!(set.len(), 1, "only today's entry survives");
+
+        // And it is still the one that matters.
+        let b = board(&[("combat", 1.0, 641.0, 2.0)]);
+        let (picked, _) = select(&b, &ctx(&settings(), &strong(), &geared(), &set));
+        assert!(picked.is_empty(), "today's record must still block");
     }
 
     #[test]
@@ -731,7 +844,7 @@ mod selection_tests {
         let b = board(&[("combat", 5.0, 10.0, 2.0)]);
         let mut s = settings();
         s.max_tier = 2;
-        let (picked, refused) = select(&b, TODAY, &strong(), &geared(), &[], &s, 1e9);
+        let (picked, refused) = select(&b, &ctx(&s, &strong(), &geared(), &HashSet::new()));
         assert!(picked.is_empty());
         assert!(refused.is_empty(), "{refused:?}");
     }
@@ -743,7 +856,7 @@ mod selection_tests {
             level: 10.0,
             ..strong()
         };
-        let (picked, refused) = select(&b, TODAY, &weak, &geared(), &[], &settings(), 1e9);
+        let (picked, refused) = select(&b, &ctx(&settings(), &weak, &geared(), &HashSet::new()));
         assert!(picked.is_empty());
         assert!(refused[0].contains("level 50"), "{refused:?}");
     }

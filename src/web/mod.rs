@@ -102,13 +102,24 @@ pub fn spawn(config: &Config, shared: Arc<Shared>) -> Result<Running> {
 
     // A small fixed pool rather than a thread per request: a login waits on a Hive
     // node for a second or so, and one slow login should not hold up the status poll.
-    for _ in 0..4 {
+    for worker in 0..4 {
         let server = Arc::clone(&server);
         let panel = Arc::clone(&panel);
         std::thread::spawn(move || {
             for request in server.incoming_requests() {
-                panel.handle(request);
+                // A panic here would otherwise unwind the whole worker and take it
+                // out of the pool for good -- silently, since the bot carries on and
+                // nothing looks wrong until the fourth one and the panel is simply
+                // gone. Catching it costs a request and keeps the panel alive.
+                let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    panel.handle(request);
+                }));
+                if handled.is_err() {
+                    warn!(worker, "a request handler panicked; the panel is still up");
+                }
             }
+            // Reached only if the listener itself goes away.
+            warn!(worker, "control panel worker stopped");
         });
     }
 

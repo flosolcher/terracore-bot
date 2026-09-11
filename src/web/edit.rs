@@ -118,6 +118,9 @@ fn table_at<'a>(
     path: &[String],
     create: bool,
 ) -> Option<&'a mut Table> {
+    if path.is_empty() {
+        return None;
+    }
     let mut table = account_table(doc, account)?;
     for segment in &path[..path.len() - 1] {
         if create {
@@ -147,7 +150,9 @@ fn set_at(
 ) -> Result<()> {
     let rendered = to_edit_value(value)
         .with_context(|| format!("{} is not a value TOML can hold inline", path.join(".")))?;
-    let key = path.last().expect("a path always ends in a key").clone();
+    let Some(key) = path.last().cloned() else {
+        bail!("internal: tried to write a setting with no name");
+    };
     let Some(table) = table_at(doc, account, path, true) else {
         bail!("[accounts.{account}] is not a table");
     };
@@ -156,7 +161,9 @@ fn set_at(
 }
 
 fn unset_at(doc: &mut DocumentMut, account: &str, path: &[String]) {
-    let key = path.last().expect("a path always ends in a key").clone();
+    let Some(key) = path.last().cloned() else {
+        return;
+    };
     if let Some(table) = table_at(doc, account, path, false) {
         table.remove(&key);
     }

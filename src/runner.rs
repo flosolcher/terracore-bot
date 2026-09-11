@@ -25,6 +25,11 @@ pub struct Bot {
     /// When each account last claimed, so the website's 30-second claim cooldown is
     /// honoured across the pre-claim and the end-of-cycle claim.
     last_claim: HashMap<String, Instant>,
+    /// Missions this process has started, keyed by board date, type and tier. The
+    /// game records them through a queue, so for a minute or so after a start its
+    /// own answer still says nothing is running -- long enough for a second cycle
+    /// to pay for the same mission again.
+    started_missions: HashMap<String, Arc<std::sync::Mutex<HashSet<crate::missions::MissionKey>>>>,
     stop: Arc<AtomicBool>,
     /// What the control panel reads and writes. Present whether or not the panel is
     /// running, so the bot has one code path rather than two.
@@ -50,6 +55,7 @@ impl Bot {
         let mut bot = Self {
             blacklist: HashSet::new(),
             last_claim: HashMap::new(),
+            started_missions: HashMap::new(),
             config,
             api,
             hive,
@@ -74,6 +80,24 @@ impl Bot {
             let keys = self.keys.for_account(&account.name)?;
             let s = &account.settings;
             let enabled = s.enabled_actions();
+
+            // A reserve of zero means "spend everything", which is a legitimate
+            // choice and a surprising default. Say it once at start-up rather than
+            // after the balance has gone -- part of it into a 28-day stake lock.
+            if s.spend.enabled && s.spend.min_scrap_reserve <= 0.0 {
+                warn!(
+                    account = %account.name,
+                    "spending is on with min_scrap_reserve = 0, so every liquid SCRAP \
+                     above zero is fair game. `terracore-bot recommend` suggests a \
+                     reserve from this account's own mining rate."
+                );
+            }
+            if s.quest.enabled && s.quest.start && s.quest.min_scrap_reserve <= 0.0 {
+                warn!(
+                    account = %account.name,
+                    "starting missions is on with quest.min_scrap_reserve = 0"
+                );
+            }
 
             // Saying this at startup is the whole point of the active-key gate: the
             // operator learns now that a feature they enabled cannot run.
@@ -255,6 +279,12 @@ impl Bot {
             ..Default::default()
         };
 
+        let started_missions = self
+            .started_missions
+            .entry(account.name.clone())
+            .or_default()
+            .clone();
+
         let runner = Runner {
             api: &self.api,
             hive: &self.hive,
@@ -263,6 +293,7 @@ impl Bot {
             settings: &account.settings,
             blacklist: &self.blacklist,
             stop: Arc::clone(&self.stop),
+            started_missions,
         };
 
         // Consumables go first. The game queues custom_json, so a potion used now is
