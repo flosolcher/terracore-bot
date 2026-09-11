@@ -215,6 +215,18 @@ changes a formula, those tests fail rather than the bot quietly misspending.
 `./start.sh status` prints the marginal price of each goal, so you can see what the
 next point of anything would cost before enabling this at all.
 
+### Suggested settings
+
+The control panel has a **Suggest spending settings** button. It is not a fixed
+preset — it reads the account's live numbers and works the ceilings out from them,
+because what is sensible depends entirely on where you already stand. A crit point
+costing 40,960 is a bargain at 95,000 SCRAP a day and absurd at 200.
+
+One rule does most of it: *keep buying while one more point costs less than a day of
+mining income.* It scales with the account, and since every curve in this game walls
+exponentially, it stops at the next cliff on its own. Every suggested value comes back
+with the reason for it, and nothing is written until you press Save.
+
 ## The control panel
 
 Optional, off by default. A small web UI for watching the bot and editing the

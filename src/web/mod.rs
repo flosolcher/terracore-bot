@@ -281,6 +281,50 @@ impl Panel {
                 })))
             }
 
+            (Method::Get, path) if path.starts_with("/api/recommended/") => {
+                let Some(session) = self.session(request) else {
+                    return Ok(unauthorized());
+                };
+                let name = path
+                    .strip_prefix("/api/recommended/")
+                    .unwrap_or_default()
+                    .to_string();
+                if !is_hive_account_name(&name) {
+                    return Ok(error(
+                        StatusCode(400),
+                        &anyhow::anyhow!("`{name}` is not a Hive account name"),
+                    ));
+                }
+                if !session.role.may_read(&session.account, &name) {
+                    return Ok(forbidden("that is not your account"));
+                }
+
+                // Suggestions come from the account's live numbers, so this reads the
+                // game API. It changes nothing -- the panel applies the result only
+                // if somebody presses save.
+                let text =
+                    std::fs::read_to_string(&self.config_path).context("reading the config")?;
+                let config = Config::from_str(&text)?;
+                let Some(account) = config.accounts.iter().find(|a| a.name == name) else {
+                    return Ok(error(
+                        StatusCode(404),
+                        &anyhow::anyhow!("@{name} is not in the config"),
+                    ));
+                };
+                let api = crate::api::Api::new(
+                    &config.terracore.api,
+                    Duration::from_secs(config.terracore.timeout_secs),
+                    config.terracore.retries,
+                );
+                let player = match api.player(&name) {
+                    Ok(player) => player,
+                    Err(e) => return Ok(error(StatusCode(502), &e)),
+                };
+                let (settings, notes) =
+                    crate::recommend::spend_settings(&player, &account.settings.spend);
+                Ok(ok(&json!({ "spend": settings, "notes": notes })))
+            }
+
             (Method::Get, "/api/keys") => {
                 let Some(session) = self.session(request) else {
                     return Ok(unauthorized());
@@ -990,6 +1034,40 @@ delay_secs = 20
         // rather than refusing everything.
         let (status, body) = f.request("PUT", "/api/accounts/alice", Some(&admin), Some(&settings));
         assert_eq!(status, 200, "{body}");
+    }
+
+    #[test]
+    fn suggestions_are_gated_before_anything_reaches_the_network() {
+        // Every refusal below happens before the handler calls the game API, so this
+        // needs no network -- and a regression that moved the checks after the call
+        // would hang here rather than pass.
+        let f = start("suggest");
+
+        // No session at all.
+        assert_eq!(
+            f.request("GET", "/api/recommended/alice", None, None).0,
+            401
+        );
+
+        // An operator may only ask about itself.
+        let operator = f.session("bob", WebRole::Operator);
+        assert_eq!(
+            f.request("GET", "/api/recommended/alice", Some(&operator), None)
+                .0,
+            403
+        );
+
+        let admin = f.session("adminuser", WebRole::Admin);
+        // A name that is not a Hive account name.
+        assert_eq!(
+            f.request("GET", "/api/recommended/Alice", Some(&admin), None)
+                .0,
+            400
+        );
+        // A well-formed name that is not in the config.
+        let (status, body) = f.request("GET", "/api/recommended/nosuchacct", Some(&admin), None);
+        assert_eq!(status, 404, "{body}");
+        assert!(body.contains("not in the config"), "{body}");
     }
 
     #[test]

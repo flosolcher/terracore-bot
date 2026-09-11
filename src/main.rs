@@ -9,6 +9,7 @@ mod config;
 mod curves;
 mod hive;
 mod keys;
+mod recommend;
 mod runner;
 mod state;
 mod targeting;

@@ -1,15 +1,26 @@
 //! The game's own stat curves, and what the next point of each one costs.
 //!
 //! Every formula here is transcribed from the game client's bundle rather than
-//! guessed, including two details that look like typos and are not: `get_luck`
-//! compares with `>` where dodge and crit use `>=`, and the first crit band divides
-//! by `2^0 = 1`, so it does nothing at all.
+//! guessed, including two oddities carried over faithfully: `get_luck` compares with
+//! `>` where dodge and crit use `>=`, and the first band divides by `2^0 = 1`, so it
+//! does nothing at all.
+//!
+//! Neither oddity is observable, and it is worth saying why rather than implying a
+//! significance they do not have. At a band edge `n == band`, the fold evaluates to
+//! `band + (n - band) / 2^i`, and `n - band` is zero -- so the result is `band`
+//! whichever comparison is used and whatever the divisor. Mutation testing found
+//! this: flipping either comparison changed no value any test could see, because
+//! there is no value to change. What actually makes dodge and luck differ is their
+//! band *tables*, not their operators.
 //!
 //! All of it is pure arithmetic, so the spending policy can be tested without a
 //! network, an account, or a single broadcast.
 
 /// Diminishing-return bands. Once a raw value passes a band, everything above it is
 /// divided by `2^i` -- so each band roughly doubles the price of the next point.
+///
+/// `inclusive` mirrors the client, which is inconsistent between curves. It makes no
+/// difference to any result; see the module docs.
 fn banded(raw: f64, bands: &[f64], inclusive: bool) -> f64 {
     let mut n = raw;
     for (i, &band) in bands.iter().enumerate() {
@@ -217,10 +228,10 @@ mod tests {
         assert!((dodge_from_stake(10_000.0) - 12.09).abs() < 0.01);
         assert!((luck_from_stake(1_000.0) - 5.078).abs() < 0.01);
         assert!((luck_from_stake(800.0) - 5.0).abs() < 1e-9);
-        // Exactly on a shared band, `>` and `>=` part company: 0.025 * 120 = 3.0 is a
-        // band in both tables, dodge folds nothing and stops at 3, luck has already
-        // folded twice on its way past 1 and 2 and lands at 2.5. Getting this
-        // backwards would misprice every stake decision, so it is pinned.
+        // The same stake gives different dodge and luck because the two curves have
+        // different band tables, not because of the `>` / `>=` difference: at
+        // 0.025 * 120 = 3.0, dodge is still on its first band and stops at 3, while
+        // luck has already folded twice past 1 and 2 and lands at 2.5.
         assert_eq!(dodge_from_stake(120.0), 3.0);
         assert_eq!(luck_from_stake(120.0), 2.5);
     }
@@ -298,6 +309,21 @@ mod tests {
         assert_eq!(favor_affordable(44_000.0, 1_000.0), 0.0);
         // A ceiling above the next cliff carries on past it.
         assert!(crit_from_favor(44_000.0 + favor_affordable(44_000.0, 2_000_000.0)) > 12.5);
+    }
+
+    #[test]
+    fn the_comparison_operator_is_genuinely_interchangeable() {
+        // Documenting an equivalence rather than pretending a distinction. At a band
+        // edge the fold is a no-op, so `>` and `>=` cannot differ -- which is why
+        // mutating one changes nothing, and why no test should claim otherwise.
+        for band in [3.0f64, 5.0, 7.0, 8.0] {
+            let raw = band;
+            assert_eq!(
+                banded(raw, &CRIT_BANDS, true),
+                banded(raw, &CRIT_BANDS, false),
+                "at the exact band {band} the two forms must agree"
+            );
+        }
     }
 
     #[test]

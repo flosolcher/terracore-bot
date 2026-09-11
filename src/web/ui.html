@@ -384,6 +384,8 @@ function renderSettings() {
     const draft = JSON.parse(JSON.stringify(account.settings));
     let enabled = account.enabled;
     const body = el("div", {});
+    // Declared up here because the suggest button writes into it too.
+    const status = el("div", { class: "note", style: "margin-top:10px" });
 
     const redraw = () => {
       body.replaceChildren(
@@ -394,7 +396,6 @@ function renderSettings() {
     };
     redraw();
 
-    const status = el("span", { class: "note" });
     return el("div", { class: "card" },
       el("h2", {}, `@${account.name}`,
         el("span", { class: "role", text: account.writable ? "editable" : "read-only" })),
@@ -405,6 +406,26 @@ function renderSettings() {
           onchange: (e) => { enabled = e.target.checked; },
         })),
       body,
+      account.writable && draft.spend ? el("div", { style: "margin-bottom:12px" },
+        el("button", {
+          text: "Suggest spending settings",
+          title: "Works them out from this account's own numbers. Nothing is saved until you press Save.",
+          onclick: async (e) => {
+            e.target.disabled = true;
+            status.textContent = "Reading the account…";
+            try {
+              const r = await api(`/api/recommended/${encodeURIComponent(account.name)}`);
+              Object.assign(draft.spend, r.spend);
+              redraw();
+              status.replaceChildren(
+                el("div", { class: "note", text: "Suggested — review, then Save:" }),
+                ...r.notes.map((n) => el("div", { class: "hint", style: "grid-column:1" },
+                  `${n.field} = ${n.value} — ${n.why}`)),
+              );
+            } catch (err) { status.textContent = err.message; }
+            finally { e.target.disabled = false; }
+          },
+        })) : null,
       account.writable ? el("div", { style: "display:flex;gap:10px;align-items:center" },
         el("button", {
           class: "primary", text: "Save",
@@ -423,8 +444,10 @@ function renderSettings() {
           },
         }),
         el("button", { text: "Revert", onclick: () => render() }),
-        status,
       ) : null,
+      // Its own row, not squeezed into the flex line beside the buttons: the
+      // suggestion notes are several lines of prose and were being clipped there.
+      status,
     );
   });
 }

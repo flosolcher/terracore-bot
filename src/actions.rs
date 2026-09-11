@@ -972,10 +972,13 @@ pub fn plan(
     let goals = open_goals(&w, s, unreachable);
     if goals.is_empty() {
         if s.stake.enabled && s.stake.absorb_surplus && !capped(steps.len()) {
-            steps.push(Step::Stake {
-                amount: spendable,
-                why: "surplus",
-            });
+            let amount = spendable.min(stake_room(&w, s));
+            if amount > 1.0 {
+                steps.push(Step::Stake {
+                    amount,
+                    why: "surplus",
+                });
+            }
         }
         return steps;
     }
@@ -993,13 +996,29 @@ pub fn plan(
 
     // Lumpy goals leave change. Staking it is opt-in precisely because leaving it
     // liquid is how it accumulates into a purchase no single cycle could afford.
-    if unused > 1.0 && s.stake.enabled && s.stake.absorb_surplus && !capped(steps.len()) {
-        steps.push(Step::Stake {
-            amount: unused,
-            why: "unused share",
-        });
+    if s.stake.enabled && s.stake.absorb_surplus && !capped(steps.len()) {
+        let amount = unused.min(stake_room(&w, s));
+        if amount > 1.0 {
+            steps.push(Step::Stake {
+                amount,
+                why: "unused share",
+            });
+        }
     }
     steps
+}
+
+/// How much more may be staked before `max_stake` is reached.
+///
+/// Stated once, because the surplus paths did not consult it at all: an absorb step
+/// could blow through an explicit cap by any margin, and staked SCRAP is locked for
+/// 28 days.
+fn stake_room(w: &Wallet, s: &SpendSettings) -> f64 {
+    if s.stake.max_stake > 0.0 {
+        (s.stake.max_stake - w.stake).max(0.0)
+    } else {
+        f64::INFINITY
+    }
 }
 
 /// Which goals still want money, and how hard each one pulls.
@@ -1068,10 +1087,7 @@ fn allocate(
             0.0
         }
         Goal::Stake => {
-            let mut amount = budget;
-            if s.stake.max_stake > 0.0 {
-                amount = amount.min((s.stake.max_stake - w.stake).max(0.0));
-            }
+            let amount = budget.min(stake_room(w, s));
             if amount > 1.0 {
                 steps.push(Step::Stake {
                     amount,
@@ -1330,6 +1346,47 @@ mod plan_tests {
     }
 
     #[test]
+    fn engineering_stops_mid_run_once_the_payback_limit_is_crossed() {
+        // The gap mutation testing found. `open_goals` checks payback once, for the
+        // level you start at -- but a big budget buys many points in one pass, and
+        // without the check inside the loop it would run far past the limit. From
+        // level 20 with a 30-day limit and a quarter-million to spend, the unchecked
+        // version climbs to about level 91.
+        let mut s = settings();
+        s.engineering.max_payback_days = 30.0;
+        s.favor.enabled = false;
+        s.stake.enabled = false;
+        let steps = plan(wallet(500_000.0, 10_000.0, 44_000.0, 20.0), &s, 20.0, None);
+
+        let bought = steps
+            .iter()
+            .filter(|x| {
+                matches!(
+                    x,
+                    Step::Stat {
+                        stat: Stat::Damage,
+                        ..
+                    } | Step::Stat {
+                        stat: Stat::Engineering,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let finished_at = 20.0 + bought as f64;
+        assert!(
+            curves::engineering_payback_days(finished_at - 1.0) <= 30.0,
+            "bought {bought} points, ending at level {finished_at}, whose payback is {}",
+            curves::engineering_payback_days(finished_at - 1.0)
+        );
+        assert!(
+            finished_at < 40.0,
+            "ran past the limit to level {finished_at}"
+        );
+        assert!(bought > 0, "it should still buy the cheap ones");
+    }
+
+    #[test]
     fn damage_is_bought_only_when_the_board_says_it_is_needed() {
         let mut s = settings();
         s.damage.enabled = true;
@@ -1381,5 +1438,105 @@ mod plan_tests {
         s.favor.enabled = false;
         s.stake.enabled = false;
         assert!(plan(wallet(900_000.0, 10_000.0, 44_000.0, 20.0), &s, 20.0, None).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod plan_audit {
+    //! Edge cases found by reading the planner rather than running it.
+    use super::*;
+    use crate::config::Settings;
+
+    fn wallet(liquid: f64, stake: f64, favor: f64, engineering: f64) -> Wallet {
+        Wallet {
+            liquid,
+            stake,
+            favor,
+            engineering,
+            damage: 500.0,
+            defense: 500.0,
+        }
+    }
+    fn settings() -> SpendSettings {
+        let mut s = Settings::default().spend;
+        s.enabled = true;
+        s.min_stash_hours = 0.0;
+        s
+    }
+    fn total_staked(steps: &[Step]) -> f64 {
+        steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Stake { amount, .. } => Some(*amount),
+                _ => None,
+            })
+            .sum()
+    }
+    fn total_spent(steps: &[Step]) -> f64 {
+        steps
+            .iter()
+            .map(|s| match s {
+                Step::Stake { amount, .. } | Step::Favor { amount } | Step::Stat { amount, .. } => {
+                    *amount
+                }
+            })
+            .sum()
+    }
+
+    #[test]
+    fn absorbing_the_surplus_still_respects_max_stake() {
+        let mut s = settings();
+        s.engineering.enabled = false;
+        s.favor.enabled = false;
+        s.stake.max_stake = 12_000.0; // only 2,000 of room left
+        s.stake.absorb_surplus = true;
+        let steps = plan(wallet(500_000.0, 10_000.0, 44_000.0, 20.0), &s, 20.0, None);
+
+        let staked = total_staked(&steps);
+        assert!(
+            staked <= 2_000.0 + 1.0,
+            "max_stake of 12,000 with 10,000 already staked allows 2,000, but it staked {staked}"
+        );
+    }
+
+    #[test]
+    fn the_plan_never_spends_more_than_is_available() {
+        // Across a spread of shapes, including ones where goals clip their shares.
+        let mut s = settings();
+        s.stake.absorb_surplus = true;
+        for (liquid, stake, favor, eng) in [
+            (500_000.0, 10_000.0, 44_000.0, 20.0),
+            (1_000.0, 0.0, 0.0, 5.0),
+            (10_000_000.0, 3_000_000.0, 90_000.0, 400.0),
+            (250.0, 100.0, 119.0, 1.0),
+        ] {
+            let steps = plan(wallet(liquid, stake, favor, eng), &s, eng, None);
+            let spent = total_spent(&steps);
+            assert!(
+                spent <= liquid + 1e-6,
+                "spent {spent} of {liquid} available"
+            );
+        }
+    }
+
+    #[test]
+    fn nonsense_from_the_api_cannot_produce_a_nonsense_purchase() {
+        let s = settings();
+        // Negative and NaN balances must fail closed rather than compute a bizarre
+        // amount: these values come from an API, not from us.
+        for liquid in [-1_000.0, f64::NAN] {
+            let steps = plan(wallet(liquid, 10_000.0, 44_000.0, 20.0), &s, 20.0, None);
+            assert!(steps.is_empty(), "liquid {liquid} produced {steps:?}");
+        }
+        // And no step may ever carry a non-positive or non-finite amount.
+        let steps = plan(wallet(500_000.0, 10_000.0, 44_000.0, 20.0), &s, 20.0, None);
+        for step in &steps {
+            let amount = match step {
+                Step::Stake { amount, .. } | Step::Favor { amount } | Step::Stat { amount, .. } => {
+                    *amount
+                }
+            };
+            assert!(amount.is_finite() && amount > 0.0, "bad amount in {step:?}");
+        }
     }
 }
