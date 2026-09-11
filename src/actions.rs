@@ -15,21 +15,11 @@ use serde_json::json;
 use tracing::{debug, info, warn};
 
 use crate::api::{format_number, now_ms, Api, Player, Quest};
-use crate::config::{BossOrder, Settings, Stat, UpgradeOrder};
+use crate::config::{BossOrder, Settings, SpendSettings, Stat};
+use crate::curves;
 use crate::hive::{tx_hash, Auth, Broadcaster};
 use crate::keys::AccountKeys;
 use crate::targeting::{self, Context as TargetContext};
-
-/// Ports the website's upgrade pricing. `engineering` costs its own current value
-/// squared; `damage` and `defense` cost a tenth of theirs, squared. The basis is the
-/// *base* stat, before items -- equipping a better weapon does not make the next
-/// point of damage cheaper.
-pub fn upgrade_cost(stat: Stat, current: f64) -> f64 {
-    match stat {
-        Stat::Engineering => current * current,
-        Stat::Damage | Stat::Defense => (current / 10.0) * (current / 10.0),
-    }
-}
 
 /// Everything an action needs. Held per account for the length of one cycle.
 pub struct Runner<'a> {
@@ -495,125 +485,172 @@ impl Runner<'_> {
     }
 
     // -----------------------------------------------------------------------
-    // Upgrades -- active key
+    // Spending -- active key
     // -----------------------------------------------------------------------
 
-    /// Burn liquid SCRAP to raise a base stat.
+    /// Divide the liquid balance between the things SCRAP can be turned into.
     ///
-    /// Paid from the Hive-Engine balance, not the stash: unclaimed scrap cannot buy
-    /// anything, which is why claiming comes first in a cycle.
-    pub fn upgrades(&self, player: &Player) -> Result<Outcome> {
-        let s = &self.settings.upgrade;
+    /// The decision is [`plan`], which is pure; this only carries it out. Splitting
+    /// them is what makes the rotation testable at all -- the policy is the subtle
+    /// part and broadcasting is not.
+    pub fn spend(&self, player: &Player) -> Result<Outcome> {
+        let s = &self.settings.spend;
         if !s.enabled {
-            return Ok(Outcome::skipped("upgrades are disabled"));
+            return Ok(Outcome::skipped("spending is disabled"));
         }
-        let active = match self.active_key("upgrades") {
+        let active = match self.active_key("spending") {
             Ok(key) => key,
             Err(outcome) => return Ok(outcome),
         };
 
-        // Tracked locally so several upgrades in one cycle each pay the right,
-        // rising price -- the API will not have caught up between broadcasts.
-        let mut engineering = player.engineering;
-        let mut damage = player.damage;
-        let mut defense = player.defense;
-        let mut balance = player.hive_engine_scrap;
-        let mut done = 0;
-        let mut last_reason = String::new();
+        let wallet = Wallet {
+            liquid: player.hive_engine_scrap,
+            stake: player.hive_engine_stake,
+            favor: player.favor,
+            engineering: player.engineering,
+            damage: player.damage,
+            defense: player.defense,
+        };
+        let unreachable = self.unreachable_percent(player, s)?;
+        let steps = plan(wallet.clone(), s, player.stats.engineering, unreachable);
 
-        while s.max_per_cycle == 0 || done < s.max_per_cycle {
+        if steps.is_empty() {
+            return Ok(Outcome::skipped(idle_reason(&wallet, s)));
+        }
+
+        let mut done = 0;
+        for step in &steps {
             if self.stopping() {
                 break;
             }
-
-            let current = |stat: Stat| match stat {
-                Stat::Engineering => engineering,
-                Stat::Damage => damage,
-                Stat::Defense => defense,
-            };
-            let ceiling = |stat: Stat| match stat {
-                Stat::Engineering => s.max_engineering,
-                Stat::Damage => s.max_damage,
-                Stat::Defense => s.max_defense,
-            };
-
-            let mut affordable: Vec<(Stat, f64)> = s
-                .stats
-                .iter()
-                .copied()
-                .filter_map(|stat| {
-                    let cap = ceiling(stat);
-                    if cap > 0.0 && current(stat) >= cap {
-                        last_reason = format!("{} is at its configured ceiling", stat.as_str());
-                        return None;
-                    }
-                    let cost = upgrade_cost(stat, current(stat));
-                    if s.max_cost > 0.0 && cost > s.max_cost {
-                        last_reason = format!(
-                            "the next {} costs {:.0}, above max_cost",
-                            stat.as_str(),
-                            cost
-                        );
-                        return None;
-                    }
-                    if balance - cost < s.min_scrap_reserve {
-                        last_reason = format!(
-                            "the next {} costs {:.0}, leaving less than min_scrap_reserve of {:.0}",
-                            stat.as_str(),
-                            cost,
-                            s.min_scrap_reserve
-                        );
-                        return None;
-                    }
-                    Some((stat, cost))
-                })
-                .collect();
-
-            if s.order == UpgradeOrder::Cheapest {
-                affordable
-                    .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            }
-
-            let Some(&(stat, cost)) = affordable.first() else {
-                break;
-            };
-
-            let sent = self.hive.engine_transfer(
-                self.account,
-                active,
-                "SCRAP",
-                "null",
-                &format_number(cost),
-                json!(format!("terracore_{}-{}", stat.as_str(), tx_hash())),
-            )?;
-            info!(
-                account = self.account,
-                stat = stat.as_str(),
-                from = current(stat),
-                cost = format!("{:.2}", cost),
-                trx = sent.trx_id(),
-                dry_run = sent.was_dry_run(),
-                "upgraded",
-            );
-
-            balance -= cost;
-            match stat {
-                Stat::Engineering => engineering += 1.0,
-                Stat::Damage => damage += 1.0,
-                Stat::Defense => defense += 1.0,
+            match step {
+                Step::Stake { amount, why } => self.stake(active, *amount, why)?,
+                Step::Favor { amount } => self.burn(
+                    active,
+                    *amount,
+                    &format!("terracore_contribute-{}", tx_hash()),
+                )?,
+                Step::Stat { stat, amount } => self.burn(
+                    active,
+                    *amount,
+                    &format!("terracore_{}-{}", stat.as_str(), tx_hash()),
+                )?,
             }
             done += 1;
             self.wait(s.delay_secs);
         }
-
-        if done == 0 {
-            return Ok(Outcome::skipped(if last_reason.is_empty() {
-                "nothing to upgrade".to_string()
-            } else {
-                last_reason
-            }));
-        }
         Ok(Outcome::did(done))
+    }
+
+    /// What share of the battle board this account cannot reach, if damage buying
+    /// needs to know. `None` when the question does not arise or cannot be answered.
+    fn unreachable_percent(&self, player: &Player, s: &SpendSettings) -> Result<Option<f64>> {
+        if !s.damage.enabled {
+            return Ok(None);
+        }
+        let board = match self.api.battles(
+            player.stats.damage,
+            self.settings.attack.candidate_limit,
+            1,
+            false,
+        ) {
+            Ok(board) if !board.is_empty() => board,
+            _ => return Ok(None),
+        };
+        let out_of_reach = board
+            .iter()
+            .filter(|t| t.defense() >= player.stats.damage)
+            .count();
+        Ok(Some(out_of_reach as f64 * 100.0 / board.len() as f64))
+    }
+
+    /// Send SCRAP to `null`, which is how the game charges for a stat or for favor.
+    fn burn(&self, active: &PrivateKey, amount: f64, memo: &str) -> Result<()> {
+        let sent = self.hive.engine_transfer(
+            self.account,
+            active,
+            "SCRAP",
+            "null",
+            &format_number(amount),
+            json!(memo),
+        )?;
+        info!(
+            account = self.account,
+            amount = format!("{amount:.2}"),
+            memo,
+            trx = sent.trx_id(),
+            dry_run = sent.was_dry_run(),
+            "burned SCRAP",
+        );
+        Ok(())
+    }
+
+    /// Stake SCRAP to yourself. Not a burn -- the balance stays yours.
+    fn stake(&self, active: &PrivateKey, amount: f64, why: &str) -> Result<()> {
+        let sent = self
+            .hive
+            .engine_stake(self.account, active, "SCRAP", &format_number(amount))?;
+        info!(
+            account = self.account,
+            amount = format!("{amount:.2}"),
+            why,
+            trx = sent.trx_id(),
+            dry_run = sent.was_dry_run(),
+            "staked SCRAP",
+        );
+        Ok(())
+    }
+}
+
+/// What the account holds, tracked locally through a cycle so each purchase pays the
+/// price that follows the one before it rather than a price the API has not caught
+/// up with yet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Wallet {
+    pub liquid: f64,
+    pub stake: f64,
+    pub favor: f64,
+    pub engineering: f64,
+    pub damage: f64,
+    pub defense: f64,
+}
+
+impl Wallet {
+    pub fn stat(&self, stat: crate::config::Stat) -> f64 {
+        match stat {
+            crate::config::Stat::Engineering => self.engineering,
+            crate::config::Stat::Damage => self.damage,
+            crate::config::Stat::Defense => self.defense,
+        }
+    }
+
+    pub fn bump(&mut self, stat: crate::config::Stat) {
+        match stat {
+            crate::config::Stat::Engineering => self.engineering += 1.0,
+            crate::config::Stat::Damage => self.damage += 1.0,
+            crate::config::Stat::Defense => self.defense += 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Goal {
+    Engineering,
+    Favor,
+    Stake,
+    Damage,
+    Defense,
+}
+
+impl Goal {
+    fn stat(self) -> crate::config::Stat {
+        match self {
+            Goal::Engineering => crate::config::Stat::Engineering,
+            Goal::Damage => crate::config::Stat::Damage,
+            Goal::Defense => crate::config::Stat::Defense,
+            // Only ever called for the lumpy goals.
+            Goal::Favor | Goal::Stake => crate::config::Stat::Engineering,
+        }
     }
 }
 
@@ -672,7 +709,7 @@ mod tests {
     fn boss_fights_and_upgrades_refuse_to_run_without_an_active_key() {
         let mut settings = Settings::default();
         settings.boss.enabled = true;
-        settings.upgrade.enabled = true;
+        settings.spend.enabled = true;
 
         let (api, hive, keys) = parts(None);
         let blacklist = HashSet::new();
@@ -689,7 +726,7 @@ mod tests {
             boss.skipped_reason
         );
 
-        let upgrade = runner.upgrades(&Player::default()).unwrap();
+        let upgrade = runner.spend(&Player::default()).unwrap();
         assert_eq!(upgrade.performed, 0);
         assert!(
             upgrade
@@ -707,24 +744,24 @@ mod tests {
         // The counterpart to the test above. Without this, an action that always
         // skipped for any reason would pass that one for the wrong reason.
         let mut settings = Settings::default();
-        settings.upgrade.enabled = true;
+        settings.spend.enabled = true;
 
         let (api, hive, keys) = parts(Some(PrivateKey::from_wif(THROWAWAY).unwrap()));
         let blacklist = HashSet::new();
         let runner = runner!(api, hive, keys, settings, blacklist);
 
-        // A stat worth 10,000 SCRAP to raise, and nothing in the wallet to pay with,
-        // so it stops for lack of funds rather than for lack of a key.
+        // Nothing in the wallet, so it stops for lack of funds rather than for lack
+        // of a key -- which is the whole point: the gate opened.
         let player = Player {
             engineering: 100.0,
             hive_engine_scrap: 0.0,
             ..Default::default()
         };
-        let upgrade = runner.upgrades(&player).unwrap();
-        assert_eq!(upgrade.performed, 0);
-        let reason = upgrade.skipped_reason.unwrap_or_default();
+        let outcome = runner.spend(&player).unwrap();
+        assert_eq!(outcome.performed, 0);
+        let reason = outcome.skipped_reason.unwrap_or_default();
         assert!(!reason.contains("active key"), "{reason}");
-        assert!(reason.contains("min_scrap_reserve"), "{reason}");
+        assert!(reason.contains("spendable"), "{reason}");
     }
 
     /// The three guards that stop an attack run before it starts. Each is checked
@@ -880,21 +917,469 @@ mod tests {
             .unwrap_or_default();
         assert!(reason.contains("disabled"), "{reason}");
     }
+}
 
-    #[test]
-    fn upgrade_prices_match_the_website() {
-        // engineering: n^2. A level-519 engineer pays 519^2 for the next point.
-        assert_eq!(upgrade_cost(Stat::Engineering, 519.0), 269_361.0);
-        // damage and defense: (n/10)^2.
-        assert_eq!(upgrade_cost(Stat::Damage, 3290.0), 108_241.0);
-        assert_eq!(upgrade_cost(Stat::Defense, 100.0), 100.0);
-        // Fractional stats price fractionally rather than rounding, which is what
-        // the client's arithmetic does.
-        assert_eq!(upgrade_cost(Stat::Damage, 3295.0), 108_570.25);
+/// One thing the bot has decided to do with SCRAP.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Step {
+    /// Staked to yourself: raises dodge, luck and the stash ceiling, and is not spent.
+    Stake { amount: f64, why: &'static str },
+    /// Burned for critical-hit chance.
+    Favor { amount: f64 },
+    /// Burned for one point of a base stat.
+    Stat { stat: Stat, amount: f64 },
+}
+
+/// Decide what to do with the liquid balance.
+///
+/// Pure: no network, no clock, no keys, no broadcasts. Everything subtle about the
+/// policy lives here so it can be tested directly, which matters because the failure
+/// mode of a spending policy is not a crash -- it is quietly buying the wrong thing
+/// with real money for weeks.
+pub fn plan(
+    mut w: Wallet,
+    s: &SpendSettings,
+    effective_engineering: f64,
+    unreachable: Option<f64>,
+) -> Vec<Step> {
+    let mut steps: Vec<Step> = Vec::new();
+    let capped = |n: usize| s.max_per_cycle > 0 && n >= s.max_per_cycle as usize;
+
+    // --- the need, outside the rotation ------------------------------------
+    // A full stash stops the bot attacking entirely, so headroom is not a
+    // preference to be balanced against the others.
+    if s.min_stash_hours > 0.0 && s.stake.enabled {
+        let wanted = curves::minerate_per_day(effective_engineering) * s.min_stash_hours / 24.0;
+        let short = wanted - (w.stake + 1.0);
+        let available = (w.liquid - s.min_scrap_reserve).max(0.0);
+        if short > 0.0 && available > 0.0 {
+            let amount = short.min(available);
+            steps.push(Step::Stake {
+                amount,
+                why: "stash headroom",
+            });
+            w.liquid -= amount;
+            w.stake += amount;
+        }
+    }
+
+    let spendable = (w.liquid - s.min_scrap_reserve).max(0.0);
+    if spendable <= 0.0 {
+        return steps;
+    }
+
+    // --- the rotation -------------------------------------------------------
+    let goals = open_goals(&w, s, unreachable);
+    if goals.is_empty() {
+        if s.stake.enabled && s.stake.absorb_surplus && !capped(steps.len()) {
+            steps.push(Step::Stake {
+                amount: spendable,
+                why: "surplus",
+            });
+        }
+        return steps;
+    }
+
+    let total_weight: f64 = goals.iter().map(|(_, weight)| *weight).sum();
+    let mut unused = 0.0;
+    for (goal, weight) in &goals {
+        if capped(steps.len()) {
+            break;
+        }
+        let budget = spendable * weight / total_weight;
+        let spent = allocate(*goal, budget, &mut w, s, &mut steps, &capped);
+        unused += budget - spent;
+    }
+
+    // Lumpy goals leave change. Staking it is opt-in precisely because leaving it
+    // liquid is how it accumulates into a purchase no single cycle could afford.
+    if unused > 1.0 && s.stake.enabled && s.stake.absorb_surplus && !capped(steps.len()) {
+        steps.push(Step::Stake {
+            amount: unused,
+            why: "unused share",
+        });
+    }
+    steps
+}
+
+/// Which goals still want money, and how hard each one pulls.
+fn open_goals(w: &Wallet, s: &SpendSettings, unreachable: Option<f64>) -> Vec<(Goal, f64)> {
+    let mut open = Vec::new();
+
+    if s.engineering.enabled && s.engineering.weight > 0.0 {
+        let capped = s.engineering.max_level > 0.0 && w.engineering >= s.engineering.max_level;
+        let slow = curves::engineering_payback_days(w.engineering) > s.engineering.max_payback_days;
+        if !capped && !slow {
+            open.push((Goal::Engineering, s.engineering.weight));
+        }
+    }
+    if s.favor.enabled && s.favor.weight > 0.0 {
+        let capped = s.favor.max_crit > 0.0 && curves::crit_from_favor(w.favor) >= s.favor.max_crit;
+        let dear = curves::scrap_per_crit_point(w.favor) > s.favor.max_scrap_per_crit_point;
+        if !capped && !dear {
+            open.push((Goal::Favor, s.favor.weight));
+        }
+    }
+    if s.stake.enabled && s.stake.weight > 0.0 {
+        let capped = s.stake.max_stake > 0.0 && w.stake >= s.stake.max_stake;
+        let dear = curves::scrap_per_dodge_point(w.stake) > s.stake.max_scrap_per_dodge_point;
+        if !capped && !dear {
+            open.push((Goal::Stake, s.stake.weight));
+        }
+    }
+    // Damage only on evidence: the board has to actually be out of reach.
+    if s.damage.enabled && s.damage.weight > 0.0 {
+        let capped = s.damage.max_level > 0.0 && w.damage >= s.damage.max_level;
+        let needed = unreachable.is_some_and(|pct| pct >= s.damage.min_unreachable_percent);
+        if !capped && needed {
+            open.push((Goal::Damage, s.damage.weight));
+        }
+    }
+    if s.damage.defense_enabled && s.damage.defense_weight > 0.0 {
+        let capped = s.damage.max_defense > 0.0 && w.defense >= s.damage.max_defense;
+        if !capped {
+            open.push((Goal::Defense, s.damage.defense_weight));
+        }
+    }
+    open
+}
+
+/// Turn one goal's share into steps. Returns what it managed to use.
+fn allocate(
+    goal: Goal,
+    budget: f64,
+    w: &mut Wallet,
+    s: &SpendSettings,
+    steps: &mut Vec<Step>,
+    capped: &dyn Fn(usize) -> bool,
+) -> f64 {
+    match goal {
+        // Continuous: spend the share, but never past the point where another
+        // percent stops being worth its price.
+        Goal::Favor => {
+            let room = curves::favor_affordable(w.favor, s.favor.max_scrap_per_crit_point);
+            let amount = budget.min(room);
+            if amount > 1.0 {
+                steps.push(Step::Favor { amount });
+                w.liquid -= amount;
+                w.favor += amount;
+                return amount;
+            }
+            0.0
+        }
+        Goal::Stake => {
+            let mut amount = budget;
+            if s.stake.max_stake > 0.0 {
+                amount = amount.min((s.stake.max_stake - w.stake).max(0.0));
+            }
+            if amount > 1.0 {
+                steps.push(Step::Stake {
+                    amount,
+                    why: "rotation",
+                });
+                w.liquid -= amount;
+                w.stake += amount;
+                return amount;
+            }
+            0.0
+        }
+        // Lumpy: whole points only, as many as the share covers.
+        Goal::Engineering | Goal::Damage | Goal::Defense => {
+            let stat = goal.stat();
+            let mut spent = 0.0;
+            loop {
+                if capped(steps.len()) {
+                    break;
+                }
+                let current = w.stat(stat);
+                let cost = curves::stat_cost(stat, current);
+                if cost <= 0.0 || spent + cost > budget {
+                    break;
+                }
+                if stat == Stat::Engineering
+                    && curves::engineering_payback_days(current) > s.engineering.max_payback_days
+                {
+                    break;
+                }
+                steps.push(Step::Stat { stat, amount: cost });
+                w.liquid -= cost;
+                w.bump(stat);
+                spent += cost;
+            }
+            spent
+        }
+    }
+}
+
+/// Why a cycle spent nothing, in words rather than a bare zero.
+fn idle_reason(w: &Wallet, s: &SpendSettings) -> String {
+    if (w.liquid - s.min_scrap_reserve) <= 0.0 {
+        return format!(
+            "{:.0} liquid is not above the reserve of {:.0}, so nothing is spendable",
+            w.liquid, s.min_scrap_reserve
+        );
+    }
+    "every goal is at its ceiling".to_string()
+}
+
+#[cfg(test)]
+mod plan_tests {
+    //! The spending policy, tested without a network, a key, or a broadcast.
+    //!
+    //! This is where the money decisions live, and their failure mode is not a crash
+    //! -- it is quietly buying the wrong thing, with real SCRAP, for weeks.
+
+    use super::*;
+    use crate::config::Settings;
+
+    fn wallet(liquid: f64, stake: f64, favor: f64, engineering: f64) -> Wallet {
+        Wallet {
+            liquid,
+            stake,
+            favor,
+            engineering,
+            damage: 500.0,
+            defense: 500.0,
+        }
+    }
+
+    /// Defaults, with the stash need already satisfied so it does not mask the
+    /// rotation. Tests that care about the need set it back.
+    fn settings() -> SpendSettings {
+        let mut s = Settings::default().spend;
+        s.enabled = true;
+        s.min_stash_hours = 0.0;
+        s
+    }
+
+    fn staked(steps: &[Step]) -> f64 {
+        steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Stake { amount, .. } => Some(*amount),
+                _ => None,
+            })
+            .sum()
+    }
+    fn favored(steps: &[Step]) -> f64 {
+        steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Favor { amount } => Some(*amount),
+                _ => None,
+            })
+            .sum()
+    }
+    fn on_stat(steps: &[Step], want: Stat) -> f64 {
+        steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Stat { stat, amount } if *stat == want => Some(*amount),
+                _ => None,
+            })
+            .sum()
     }
 
     #[test]
-    fn the_cost_curve_rises_with_the_stat() {
-        assert!(upgrade_cost(Stat::Engineering, 100.0) < upgrade_cost(Stat::Engineering, 101.0));
+    fn one_cycle_advances_all_three_goals_rather_than_one() {
+        // The whole point of the design: a waterfall would put everything into the
+        // first goal and the others would never move.
+        let steps = plan(
+            wallet(200_000.0, 10_000.0, 44_000.0, 40.0),
+            &settings(),
+            40.0,
+            None,
+        );
+
+        assert!(
+            on_stat(&steps, Stat::Engineering) > 0.0,
+            "engineering got nothing: {steps:?}"
+        );
+        assert!(favored(&steps) > 0.0, "favor got nothing: {steps:?}");
+        assert!(staked(&steps) > 0.0, "stake got nothing: {steps:?}");
+    }
+
+    #[test]
+    fn the_shares_follow_the_configured_weights() {
+        // Defaults are engineering 3 : stake 2 : favor 1. Favor and stake are
+        // continuous, so with no ceiling in the way they take their share exactly.
+        let mut s = settings();
+        s.favor.max_scrap_per_crit_point = 1e9;
+        let total = 600_000.0;
+        let steps = plan(wallet(total, 10_000.0, 44_000.0, 20.0), &s, 20.0, None);
+
+        assert!(
+            (staked(&steps) - total * 2.0 / 6.0).abs() < 1.0,
+            "{steps:?}"
+        );
+        assert!(
+            (favored(&steps) - total * 1.0 / 6.0).abs() < 1.0,
+            "{steps:?}"
+        );
+        // Engineering is lumpy, so it buys whole points up to its share and no more.
+        let eng = on_stat(&steps, Stat::Engineering);
+        assert!(
+            eng > 0.0 && eng <= total * 3.0 / 6.0,
+            "engineering took {eng}"
+        );
+    }
+
+    #[test]
+    fn a_share_is_a_ceiling_not_a_quota() {
+        // With the default 100,000-per-point limit, favor's share of 100,000 is more
+        // than the 43,680 left before the 12% cliff -- so it takes only what is worth
+        // taking rather than spending the share for the sake of it.
+        let s = settings();
+        let steps = plan(wallet(600_000.0, 10_000.0, 44_000.0, 20.0), &s, 20.0, None);
+        let bought = favored(&steps);
+        assert!(
+            bought < 600_000.0 / 6.0,
+            "favor spent its whole share: {bought}"
+        );
+        assert!((curves::crit_from_favor(44_000.0 + bought) - 12.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn a_goal_at_its_ceiling_hands_its_share_to_the_others() {
+        let mut s = settings();
+        // Favor priced out: from 44,000 a crit point costs 40,960.
+        s.favor.max_scrap_per_crit_point = 1_000.0;
+        let steps = plan(wallet(600_000.0, 10_000.0, 44_000.0, 40.0), &s, 40.0, None);
+
+        assert_eq!(favored(&steps), 0.0, "favor should be shut out: {steps:?}");
+        // Its weight is gone from the divisor, so stake now takes 2 of 5, not 2 of 6.
+        assert!(
+            (staked(&steps) - 600_000.0 * 2.0 / 5.0).abs() < 1.0,
+            "{steps:?}"
+        );
+    }
+
+    #[test]
+    fn favor_stops_exactly_at_the_cliff_even_with_money_to_spare() {
+        let mut s = settings();
+        s.favor.weight = 100.0; // give it nearly the whole budget
+        s.engineering.enabled = false;
+        s.stake.weight = 1.0;
+        let steps = plan(
+            wallet(5_000_000.0, 10_000.0, 44_000.0, 40.0),
+            &s,
+            40.0,
+            None,
+        );
+
+        let bought = favored(&steps);
+        let landed = curves::crit_from_favor(44_000.0 + bought);
+        // 12% is where the price jumps 32-fold; the default ceiling of 100,000 per
+        // point must stop there rather than ploughing on.
+        assert!(
+            (landed - 12.0).abs() < 0.05,
+            "landed on {landed}% after {bought}"
+        );
+    }
+
+    #[test]
+    fn a_stash_that_would_block_attacking_is_fixed_before_any_rotation() {
+        let mut s = settings();
+        s.min_stash_hours = 24.0;
+        // Engineering 40 mines 840/day, so a day of headroom needs 840 of capacity
+        // against a stake of 10.
+        let steps = plan(wallet(500_000.0, 10.0, 44_000.0, 40.0), &s, 40.0, None);
+
+        match steps.first() {
+            Some(Step::Stake { amount, why }) => {
+                assert_eq!(*why, "stash headroom", "the need must be what runs first");
+                assert!((amount - (840.5 - 11.0)).abs() < 5.0, "staked {amount}");
+            }
+            other => panic!("the need must come first, got {other:?}"),
+        }
+        // And the rotation still runs afterwards rather than being consumed by it.
+        assert!(favored(&steps) > 0.0, "{steps:?}");
+        assert!(on_stat(&steps, Stat::Engineering) > 0.0, "{steps:?}");
+        assert!(staked(&steps) > 840.0, "{steps:?}");
+    }
+
+    #[test]
+    fn nothing_is_spent_below_the_reserve() {
+        let mut s = settings();
+        s.min_scrap_reserve = 100_000.0;
+        let steps = plan(wallet(120_000.0, 10_000.0, 44_000.0, 40.0), &s, 40.0, None);
+        let spent: f64 = steps
+            .iter()
+            .map(|step| match step {
+                Step::Stake { amount, .. } | Step::Favor { amount } | Step::Stat { amount, .. } => {
+                    *amount
+                }
+            })
+            .sum();
+        assert!(spent <= 20_000.0 + 1.0, "spent {spent} of a 20,000 surplus");
+
+        // And below the reserve entirely, nothing happens at all.
+        assert!(plan(wallet(90_000.0, 10_000.0, 44_000.0, 40.0), &s, 40.0, None).is_empty());
+    }
+
+    #[test]
+    fn engineering_stops_when_a_point_takes_too_long_to_pay_for_itself() {
+        let mut s = settings();
+        s.engineering.max_payback_days = 30.0;
+        // Payback in days is about the current level, so 40 is already past 30.
+        let steps = plan(wallet(500_000.0, 10_000.0, 44_000.0, 40.0), &s, 40.0, None);
+        assert_eq!(on_stat(&steps, Stat::Engineering), 0.0, "{steps:?}");
+        // At level 20 it is well inside the limit and buys.
+        let steps = plan(wallet(500_000.0, 10_000.0, 44_000.0, 20.0), &s, 20.0, None);
+        assert!(on_stat(&steps, Stat::Engineering) > 0.0, "{steps:?}");
+    }
+
+    #[test]
+    fn damage_is_bought_only_when_the_board_says_it_is_needed() {
+        let mut s = settings();
+        s.damage.enabled = true;
+        s.damage.min_unreachable_percent = 20.0;
+
+        // Board comfortably in reach: no damage, whatever the balance.
+        let steps = plan(
+            wallet(900_000.0, 10_000.0, 44_000.0, 20.0),
+            &s,
+            20.0,
+            Some(5.0),
+        );
+        assert_eq!(on_stat(&steps, Stat::Damage), 0.0, "{steps:?}");
+        // Unknown is not a licence to buy either.
+        let steps = plan(wallet(900_000.0, 10_000.0, 44_000.0, 20.0), &s, 20.0, None);
+        assert_eq!(on_stat(&steps, Stat::Damage), 0.0, "{steps:?}");
+        // Half the board out of reach: now it is worth buying.
+        let steps = plan(
+            wallet(900_000.0, 10_000.0, 44_000.0, 20.0),
+            &s,
+            20.0,
+            Some(50.0),
+        );
+        assert!(on_stat(&steps, Stat::Damage) > 0.0, "{steps:?}");
+    }
+
+    #[test]
+    fn leftover_stays_liquid_unless_asked_for_so_it_can_accumulate() {
+        let mut s = settings();
+        s.favor.enabled = false;
+        s.stake.enabled = false;
+        s.engineering.max_payback_days = 1_000.0;
+        // A 300-level engineer needs 90,000 for the next point and has 50,000.
+        let steps = plan(wallet(50_000.0, 10_000.0, 44_000.0, 300.0), &s, 300.0, None);
+        assert!(steps.is_empty(), "the change must stay liquid: {steps:?}");
+
+        // With absorb_surplus it goes to stake instead.
+        s.stake.enabled = true;
+        s.stake.weight = 0.0;
+        s.stake.absorb_surplus = true;
+        let steps = plan(wallet(50_000.0, 10_000.0, 44_000.0, 300.0), &s, 300.0, None);
+        assert!(staked(&steps) > 0.0, "{steps:?}");
+    }
+
+    #[test]
+    fn every_goal_shut_means_no_steps_at_all() {
+        let mut s = settings();
+        s.engineering.enabled = false;
+        s.favor.enabled = false;
+        s.stake.enabled = false;
+        assert!(plan(wallet(900_000.0, 10_000.0, 44_000.0, 20.0), &s, 20.0, None).is_empty());
     }
 }

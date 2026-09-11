@@ -788,7 +788,7 @@ delay_secs = 20
 
         let mut settings = crate::config::Settings::default();
         settings.attack.delay_secs = 77;
-        settings.upgrade.enabled = true;
+        settings.spend.enabled = true;
         let body =
             serde_json::to_string(&json!({ "enabled": false, "settings": settings })).unwrap();
 

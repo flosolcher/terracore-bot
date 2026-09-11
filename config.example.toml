@@ -116,25 +116,63 @@ max_per_cycle = 0
 order = "highest_level"
 delay_secs = 10
 
-[defaults.upgrade]
+[defaults.spend]
+# Turns surplus SCRAP into stats, critical-hit chance and stake.
+#
+# Not a waterfall: each cycle the spendable balance is split between the goals
+# below by their `weight`, so engineering, favor and stake all advance together.
+# A goal that has reached its ceiling hands its share back to the others rather
+# than wasting it.
 enabled = false
-# engineering raises the mining rate, damage widens the range of reachable
-# targets, defense keeps others out. Costs are the game's own: engineering is
-# n^2, damage and defense are (n/10)^2, against the base stat before items.
-stats = ["engineering"]
-# cheapest | listed
-order = "cheapest"
-# Never spend liquid SCRAP below this balance.
+# Never spend liquid SCRAP below this.
 min_scrap_reserve = 0.0
-# Refuse any single upgrade above this price. 0 disables the cap.
-max_cost = 0.0
-max_per_cycle = 1
-# Stop buying a stat at this value. 0 disables the cap. The game softcaps
-# engineering above 333, where each further point yields half as much.
-max_engineering = 0.0
-max_damage = 0.0
-max_defense = 0.0
+# The one thing NOT rotated. A full stash stops the bot attacking at all, so the
+# stash is topped up to hold this many hours of mining before anything else is
+# considered. 0 disables the check.
+min_stash_hours = 12.0
 delay_secs = 10
+# Purchases per cycle across all goals. 0 = no cap.
+max_per_cycle = 0
+
+[defaults.spend.engineering]
+# The only goal that compounds: it raises mining income, which pays for the rest.
+# Below the game's 333 softcap, a point pays for itself in roughly as many days as
+# your current level -- so 60 keeps buying until about engineering 60.
+enabled = true
+weight = 3.0
+max_payback_days = 60.0
+max_level = 0.0          # 0 disables the cap
+
+[defaults.spend.favor]
+# Burned SCRAP, 1:1, buying critical-hit chance. The price is flat inside a band
+# and doubles at every band edge, so the ceiling is on the *marginal* price: it
+# stops exactly at the next cliff instead of at a percentage that goes stale.
+enabled = true
+weight = 1.0
+max_scrap_per_crit_point = 100000.0
+max_crit = 0.0           # 0 disables the cap
+
+[defaults.spend.stake]
+# Staking is not spending -- the SCRAP stays yours. It raises dodge, luck and the
+# stash ceiling, at the cost of the unstaking cooldown.
+enabled = true
+weight = 2.0
+max_scrap_per_dodge_point = 50000.0
+# Off by default: leftovers stay liquid and accumulate, which is what lets an
+# engineering point costing more than one cycle's share eventually be affordable.
+absorb_surplus = false
+max_stake = 0.0          # 0 disables the cap
+
+[defaults.spend.damage]
+# Damage is bought only on evidence -- when the battle board really is out of
+# reach. Defense has no such signal, so it is opt-in and capped.
+enabled = false
+weight = 1.0
+min_unreachable_percent = 20.0
+max_level = 0.0
+defense_enabled = false
+defense_weight = 1.0
+max_defense = 0.0
 
 # ---------------------------------------------------------------------------
 # Accounts

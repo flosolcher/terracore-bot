@@ -124,6 +124,9 @@ pub struct Player {
     pub level: f64,
     #[serde(default)]
     pub experience: f64,
+    /// Burned SCRAP, one for one. Crit is computed from this.
+    #[serde(default)]
+    pub favor: f64,
     /// Base stats, before items. These, not the effective `stats`, are what an
     /// upgrade's price is computed from.
     #[serde(default)]

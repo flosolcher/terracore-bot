@@ -6,6 +6,7 @@
 mod actions;
 mod api;
 mod config;
+mod curves;
 mod hive;
 mod keys;
 mod runner;
@@ -221,7 +222,7 @@ fn check(cli: &Cli) -> Result<()> {
         println!("  claim    {:?}", s.claim);
         println!("  quest    {:?}", s.quest);
         println!("  boss     {:?}", s.boss);
-        println!("  upgrade  {:?}", s.upgrade);
+        println!("  spend    {:?}", s.spend);
         println!();
     }
     Ok(())

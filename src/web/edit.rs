@@ -35,24 +35,8 @@ pub fn apply(text: &str, account: &str, incoming: &Settings, enabled: bool) -> R
     // accepted by the server, and silently never written.
     let sections: Vec<String> = incoming.keys().cloned().collect();
 
-    for section in &sections {
-        let section = section.as_str();
-        let incoming_section = incoming.get(section).and_then(|v| v.as_table());
-        let defaults_section = defaults.get(section).and_then(|v| v.as_table());
-        let (Some(incoming_section), Some(defaults_section)) = (incoming_section, defaults_section)
-        else {
-            continue;
-        };
-
-        for (key, value) in incoming_section {
-            let is_override = defaults_section.get(key) != Some(value);
-            if is_override {
-                set(&mut doc, account, section, key, value)?;
-            } else {
-                unset(&mut doc, account, section, key);
-            }
-        }
-    }
+    let mut path: Vec<String> = Vec::new();
+    diff_into(&mut doc, account, &mut path, &incoming, &defaults)?;
 
     // `enabled = true` is the default, so it is written only when it is false.
     if enabled {
@@ -85,40 +69,96 @@ fn account_table<'a>(doc: &'a mut DocumentMut, account: &str) -> Option<&'a mut 
         .as_table_mut()
 }
 
-fn set(
+/// Walk the incoming settings against the defaults, writing only what differs.
+///
+/// Recursive because the settings are not flat: a goal like `spend.engineering` is
+/// its own table. Walking only the top level silently dropped every nested value,
+/// which meant nothing under `[spend]` could be saved at all.
+fn diff_into(
     doc: &mut DocumentMut,
     account: &str,
-    section: &str,
-    key: &str,
-    value: &toml::Value,
+    path: &mut Vec<String>,
+    incoming: &toml::value::Table,
+    defaults: &toml::value::Table,
 ) -> Result<()> {
-    let value = to_edit_value(value)
-        .with_context(|| format!("{section}.{key} is not a value TOML can hold inline"))?;
-    let Some(table) = account_table(doc, account) else {
-        bail!("[accounts.{account}] is not a table");
-    };
-    let section_table = table
-        .entry(section)
-        .or_insert_with(|| {
-            let mut new = Table::new();
-            // Rendered as `[accounts.alice.attack]` rather than an inline table, so
-            // a file the UI has written still looks like one a person would write.
-            new.set_implicit(false);
-            Item::Table(new)
-        })
-        .as_table_mut();
-    let Some(section_table) = section_table else {
-        bail!("[accounts.{account}.{section}] is not a table");
-    };
-    section_table[key] = Item::Value(value);
+    for (key, value) in incoming {
+        let default_value = defaults.get(key);
+        match (value, default_value.and_then(|v| v.as_table())) {
+            (toml::Value::Table(inner), Some(inner_defaults)) => {
+                path.push(key.clone());
+                diff_into(doc, account, path, inner, inner_defaults)?;
+                path.pop();
+            }
+            (toml::Value::Table(inner), None) => {
+                // A whole group the defaults do not mention: every value in it is an
+                // override.
+                path.push(key.clone());
+                let empty = toml::value::Table::new();
+                diff_into(doc, account, path, inner, &empty)?;
+                path.pop();
+            }
+            _ => {
+                path.push(key.clone());
+                if default_value != Some(value) {
+                    set_at(doc, account, path, value)?;
+                } else {
+                    unset_at(doc, account, path);
+                }
+                path.pop();
+            }
+        }
+    }
     Ok(())
 }
 
-fn unset(doc: &mut DocumentMut, account: &str, section: &str, key: &str) {
-    if let Some(table) = account_table(doc, account) {
-        if let Some(section_table) = table.get_mut(section).and_then(Item::as_table_mut) {
-            section_table.remove(key);
+/// Descend to (creating as needed) the table holding the last path segment.
+fn table_at<'a>(
+    doc: &'a mut DocumentMut,
+    account: &str,
+    path: &[String],
+    create: bool,
+) -> Option<&'a mut Table> {
+    let mut table = account_table(doc, account)?;
+    for segment in &path[..path.len() - 1] {
+        if create {
+            table = table
+                .entry(segment)
+                .or_insert_with(|| {
+                    let mut new = Table::new();
+                    // Not implicit, so it renders as `[accounts.alice.spend.favor]`
+                    // rather than an inline table -- a file the panel has written
+                    // still looks like one a person would write.
+                    new.set_implicit(false);
+                    Item::Table(new)
+                })
+                .as_table_mut()?;
+        } else {
+            table = table.get_mut(segment)?.as_table_mut()?;
         }
+    }
+    Some(table)
+}
+
+fn set_at(
+    doc: &mut DocumentMut,
+    account: &str,
+    path: &[String],
+    value: &toml::Value,
+) -> Result<()> {
+    let rendered = to_edit_value(value)
+        .with_context(|| format!("{} is not a value TOML can hold inline", path.join(".")))?;
+    let key = path.last().expect("a path always ends in a key").clone();
+    let Some(table) = table_at(doc, account, path, true) else {
+        bail!("[accounts.{account}] is not a table");
+    };
+    table[key.as_str()] = Item::Value(rendered);
+    Ok(())
+}
+
+fn unset_at(doc: &mut DocumentMut, account: &str, path: &[String]) {
+    let key = path.last().expect("a path always ends in a key").clone();
+    if let Some(table) = table_at(doc, account, path, false) {
+        table.remove(&key);
     }
 }
 
@@ -136,18 +176,27 @@ fn unset_account_key(doc: &mut DocumentMut, account: &str, key: &str) {
 
 /// Drop `[accounts.x.attack]` once its last override is gone, so the file does not
 /// accumulate empty headings.
-fn prune_empty_sections(doc: &mut DocumentMut, account: &str, sections: &[String]) {
-    let Some(table) = account_table(doc, account) else {
-        return;
-    };
-    for section in sections {
-        let section = section.as_str();
-        let empty = table
-            .get(section)
-            .and_then(Item::as_table)
-            .is_some_and(Table::is_empty);
-        if empty {
-            table.remove(section);
+fn prune_empty_sections(doc: &mut DocumentMut, account: &str, _sections: &[String]) {
+    if let Some(table) = account_table(doc, account) {
+        prune(table);
+    }
+}
+
+/// Drop any sub-table left with nothing in it, innermost first, so removing the last
+/// override under `[spend.favor]` takes the heading with it rather than leaving an
+/// empty section behind.
+fn prune(table: &mut Table) {
+    let names: Vec<String> = table
+        .iter()
+        .filter(|(_, item)| item.is_table())
+        .map(|(name, _)| name.to_string())
+        .collect();
+    for name in names {
+        if let Some(inner) = table.get_mut(&name).and_then(Item::as_table_mut) {
+            prune(inner);
+            if inner.is_empty() {
+                table.remove(&name);
+            }
         }
     }
 }
@@ -240,15 +289,15 @@ max_enemy_dodge = 25.0   # alice is picky
     #[test]
     fn lists_and_enums_survive_the_round_trip() {
         let mut settings = settings_of(FILE, "alice");
-        settings.upgrade.enabled = true;
-        settings.upgrade.stats = vec![crate::config::Stat::Damage, crate::config::Stat::Defense];
-        settings.upgrade.order = crate::config::UpgradeOrder::Listed;
+        settings.spend.enabled = true;
+        settings.boss.planets = vec!["Oceana".into(), "Drakon".into()];
+        settings.boss.order = crate::config::BossOrder::Listed;
 
         let out = apply(FILE, "alice", &settings, true).unwrap();
         let back = settings_of(&out, "alice");
-        assert!(back.upgrade.enabled);
-        assert_eq!(back.upgrade.stats, settings.upgrade.stats);
-        assert_eq!(back.upgrade.order, crate::config::UpgradeOrder::Listed);
+        assert!(back.spend.enabled);
+        assert_eq!(back.boss.planets, settings.boss.planets);
+        assert_eq!(back.boss.order, crate::config::BossOrder::Listed);
     }
 
     #[test]
@@ -284,7 +333,7 @@ max_enemy_dodge = 25.0   # alice is picky
         settings.claim.min_scrap = 7.5;
         settings.quest.delay_secs = 61;
         settings.boss.max_flux_per_fight = 9.5;
-        settings.upgrade.max_per_cycle = 4;
+        settings.spend.max_per_cycle = 4;
 
         let out = apply(FILE, "alice", &settings, true).unwrap();
         let back = settings_of(&out, "alice");
@@ -292,7 +341,7 @@ max_enemy_dodge = 25.0   # alice is picky
         assert_eq!(back.claim.min_scrap, 7.5);
         assert_eq!(back.quest.delay_secs, 61);
         assert_eq!(back.boss.max_flux_per_fight, 9.5);
-        assert_eq!(back.upgrade.max_per_cycle, 4);
+        assert_eq!(back.spend.max_per_cycle, 4);
     }
 
     #[test]
@@ -303,5 +352,31 @@ max_enemy_dodge = 25.0   # alice is picky
 
         let out = apply(&text, "alice", &settings, true).unwrap();
         assert_eq!(settings_of(&out, "bob").attack.delay_secs, 99);
+    }
+}
+
+#[cfg(test)]
+mod nested_tests {
+    use super::*;
+    use crate::config::Config;
+
+    const FILE: &str = "[accounts.alice]\n";
+
+    /// Goals live in sub-tables, so the writer has to descend. Without that it
+    /// refuses the value outright and no spend setting can be saved from the panel.
+    #[test]
+    fn a_nested_goal_setting_round_trips() {
+        let mut settings = Config::default_settings(FILE).unwrap();
+        settings.spend.enabled = true;
+        settings.spend.engineering.weight = 5.0;
+        settings.spend.favor.max_scrap_per_crit_point = 250_000.0;
+        settings.spend.stake.absorb_surplus = true;
+
+        let out = apply(FILE, "alice", &settings, true).expect("nested settings must be writable");
+        let back = Config::from_str(&out).unwrap().accounts.remove(0).settings;
+        assert!(back.spend.enabled);
+        assert_eq!(back.spend.engineering.weight, 5.0);
+        assert_eq!(back.spend.favor.max_scrap_per_crit_point, 250_000.0);
+        assert!(back.spend.stake.absorb_surplus);
     }
 }

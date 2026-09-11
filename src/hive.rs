@@ -146,6 +146,32 @@ impl Broadcaster {
         Ok(Sent::Broadcast { trx_id })
     }
 
+    /// Stake SCRAP to yourself.
+    ///
+    /// A different contract action from a transfer, and the difference matters: the
+    /// tokens are not spent. They keep counting as your balance, they raise dodge,
+    /// luck and the stash ceiling, and they can be unstaked later -- which is why
+    /// this is the one sink the bot can be generous with.
+    pub fn engine_stake(
+        &self,
+        account: &str,
+        key: &PrivateKey,
+        symbol: &str,
+        quantity: &str,
+    ) -> Result<Sent> {
+        let payload = json!({
+            "contractName": "tokens",
+            "contractAction": "stake",
+            "contractPayload": {
+                "symbol": symbol,
+                "to": account,
+                "quantity": quantity,
+                "memo": format!("stake-{}", tx_hash()),
+            }
+        });
+        self.custom_json(account, key, Auth::Active, "ssc-mainnet-hive", payload)
+    }
+
     /// A Hive-Engine token transfer, wrapped in the `ssc-mainnet-hive` custom_json
     /// the sidechain listens for. Always active authority: this moves tokens.
     ///

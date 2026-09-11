@@ -33,7 +33,7 @@ This is a fresh implementation. Nothing was carried over but the idea.
 | **Claim** | posting key | Empties the stash into your Hive-Engine balance. |
 | **Missions** | posting key | Collects finished missions. Never *starts* one — that costs SCRAP. |
 | **Boss fights** | **active key** | Burns FLUX per fight, four-hour cooldown per planet. Off by default. |
-| **Upgrades** | **active key** | Burns SCRAP to raise engineering, damage or defense. Off by default. |
+| **Spending** | **active key** | Turns surplus SCRAP into stats, crit and stake, rotating between them. Off by default. |
 
 The last two move Hive-Engine tokens, so they need an active authority. They are
 disabled in the shipped config, and even when enabled they refuse to run unless an
@@ -166,6 +166,53 @@ prints the merged result per account.
 
 See [`config.example.toml`](config.example.toml) — every option is documented there.
 
+## What it does with your SCRAP
+
+`[defaults.spend]` decides what surplus SCRAP becomes. It is **not** a waterfall —
+each cycle the spendable balance is split between the goals by `weight`, so all of
+them advance together, and a goal that has reached its ceiling hands its share back
+to the others instead of wasting it.
+
+```
+liquid balance after claiming
+  │
+  ├─ min_scrap_reserve                      never touched
+  │
+  ├─ stash headroom                         NOT rotated: a full stash stops all
+  │                                         attacking, so it is a need
+  │
+  ├─ engineering  weight 3 ──┐
+  ├─ stake        weight 2 ──┤ split by weight, each with its own stop condition
+  ├─ favor        weight 1 ──┘
+  │
+  └─ leftover stays liquid                  so it accumulates into the next purchase
+```
+
+The weights are a starting point, not a claim to be optimal — but they come from the
+game's own curves rather than taste:
+
+- **Engineering** is the only goal that *compounds*: it raises mining income, which
+  pays for everything else. Below the game's 333 softcap a point mines back its cost
+  in roughly as many days as your current level, so `max_payback_days` expresses the
+  stopping point exactly and it self-limits near the cap.
+- **Staking is not spending.** The SCRAP stays yours; it buys dodge, luck and stash
+  ceiling for only the cost of the unstaking cooldown. Dodge is cheap to about 15%
+  (~130k staked) and then walls hard.
+- **Favor** buys crit and is burned for good. Its price is flat inside a band and
+  doubles at every edge, so the ceiling is on the *marginal* price rather than a
+  target percentage — `max_scrap_per_crit_point` stops at the next cliff wherever it
+  happens to be, and a fixed percentage goes stale as the account grows.
+- **Damage** is bought only on evidence: the bot already counts how much of the
+  battle board is out of reach, and buys only when that exceeds
+  `min_unreachable_percent`. **Defense** has no such signal, so it is opt-in.
+
+Every curve in `src/curves.rs` is transcribed from the game client and pinned by
+tests, anchored on a real account showing 44,000 favor and 10.933% crit. If the game
+changes a formula, those tests fail rather than the bot quietly misspending.
+
+`./start.sh status` prints the marginal price of each goal, so you can see what the
+next point of anything would cost before enabling this at all.
+
 ## The control panel
 
 Optional, off by default. A small web UI for watching the bot and editing the
@@ -291,6 +338,7 @@ src/
   config.rs      TOML, defaults + per-account overrides, deep-merged
   api.rs         the Terracore REST API and its shapes
   targeting.rs   who to attack, and why not the rest  (pure, tested)
+  curves.rs      the game's stat formulas and what the next point costs (pure, tested)
   hive.rs        custom_json construction, signing, broadcast
   keys.rs        the encrypted wallet
   actions.rs     attack, claim, missions, boss, upgrade

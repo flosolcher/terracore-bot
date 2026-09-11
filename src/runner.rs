@@ -306,9 +306,9 @@ impl Bot {
             Err(e) => self.note_failure("quests", &account.name, &e, &mut report),
         }
 
-        match runner.upgrades(&player) {
-            Ok(outcome) => self.note("upgrade", &account.name, &outcome, &mut report),
-            Err(e) => self.note_failure("upgrade", &account.name, &e, &mut report),
+        match runner.spend(&player) {
+            Ok(outcome) => self.note("spend", &account.name, &outcome, &mut report),
+            Err(e) => self.note_failure("spend", &account.name, &e, &mut report),
         }
 
         match runner.boss_fights() {
@@ -480,7 +480,7 @@ pub fn status(config: &Config) -> Result<()> {
         let mut enabled: Vec<String> = s.enabled_actions().iter().map(|a| a.to_string()).collect();
         if s.needs_active_key() && !has("active") {
             for action in enabled.iter_mut() {
-                if action == "boss" || action == "upgrade" {
+                if action == "boss" || action == "spend" {
                     action.push_str(" (NO ACTIVE KEY)");
                 }
             }
@@ -492,7 +492,9 @@ pub fn status(config: &Config) -> Result<()> {
              stash    {scrap:.4} / {cap:.4}{full}\n  \
              wallet   {wallet:.4} SCRAP liquid, {stake:.4} staked, {flux:.4} FLUX\n  \
              stats    damage {dmg:.0}, defense {def:.0}, engineering {eng:.0}, dodge {dodge:.1}%\n  \
-             next up  engineering {eng_cost:.0}, damage {dmg_cost:.0}, defense {def_cost:.0} SCRAP\n  \
+             next up  engineering {eng_cost:.0} ({eng_days:.0}d payback), damage {dmg_cost:.0}, defense {def_cost:.0}\n  \
+             stake    {staked:.0} -> dodge {c_dodge:.2}%, luck {c_luck:.2}%; next dodge point {dodge_cost:.0}\n  \
+             favor    {favor:.0} -> crit {c_crit:.3}%; next crit point {crit_cost:.0}\n  \
              keys     posting {posting}, active {active}\n  \
              does     {enabled}\n",
             name = account.name,
@@ -510,9 +512,19 @@ pub fn status(config: &Config) -> Result<()> {
             def = player.stats.defense,
             eng = player.stats.engineering,
             dodge = player.stats.dodge,
-            eng_cost = crate::actions::upgrade_cost(Stat::Engineering, player.engineering),
-            dmg_cost = crate::actions::upgrade_cost(Stat::Damage, player.damage),
-            def_cost = crate::actions::upgrade_cost(Stat::Defense, player.defense),
+            eng_cost = crate::curves::stat_cost(Stat::Engineering, player.engineering),
+            dmg_cost = crate::curves::stat_cost(Stat::Damage, player.damage),
+            def_cost = crate::curves::stat_cost(Stat::Defense, player.defense),
+            eng_days = crate::curves::engineering_payback_days(player.engineering),
+            staked = player.hive_engine_stake,
+            // From the game's own curves rather than the API's numbers, so a drift
+            // between the two is visible rather than hidden.
+            c_dodge = crate::curves::dodge_from_stake(player.hive_engine_stake),
+            c_luck = crate::curves::luck_from_stake(player.hive_engine_stake),
+            dodge_cost = crate::curves::scrap_per_dodge_point(player.hive_engine_stake),
+            favor = player.favor,
+            c_crit = crate::curves::crit_from_favor(player.favor),
+            crit_cost = crate::curves::scrap_per_crit_point(player.favor),
             posting = if has("posting") { "yes" } else { "MISSING" },
             active = if has("active") { "yes" } else { "no" },
             enabled = if enabled.is_empty() { "nothing".to_string() } else { enabled.join(", ") },

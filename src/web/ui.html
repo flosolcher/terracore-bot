@@ -90,6 +90,8 @@
   ul.actions .err { color: var(--bad); }
 
   fieldset { border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; margin: 0 0 12px; }
+  fieldset.nested { margin: 8px 0 12px 14px; border-color: #1f262e; background: #11151a; }
+  fieldset.nested > legend { color: var(--dim); font-size: 11px; }
   legend { padding: 0 6px; color: var(--accent); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
   .field { display: grid; grid-template-columns: 220px 1fr; gap: 12px; align-items: center; padding: 5px 0; }
   .field > label { color: var(--dim); font-size: 13px; }
@@ -187,9 +189,8 @@ const humanize = (key) => key.replace(/_/g, " ").replace(/^./, (c) => c.toUpperC
 
 const ENUMS = {
   "boss.order": ["highest_level", "cheapest", "listed"],
-  "upgrade.order": ["cheapest", "listed"],
 };
-const CHOICES = { "upgrade.stats": ["engineering", "damage", "defense"] };
+const CHOICES = {};
 const HINTS = {
   "attack.max_per_cycle": "0 means until the attacks run out",
   "attack.max_enemy_dodge": "a dodged attack still spends the attack",
@@ -200,12 +201,24 @@ const HINTS = {
   "boss.enabled": "burns FLUX — needs an active key",
   "boss.planets": "empty means every unlocked planet",
   "boss.max_per_cycle": "0 means every planet off cooldown",
-  "upgrade.enabled": "burns SCRAP — needs an active key",
-  "upgrade.max_cost": "0 disables the cap",
-  "upgrade.max_engineering": "0 disables the cap",
-  "upgrade.max_damage": "0 disables the cap",
-  "upgrade.max_defense": "0 disables the cap",
-  "upgrade.min_scrap_reserve": "never spend your liquid balance below this",
+  "spend.enabled": "burns and stakes SCRAP — needs an active key",
+  "spend.min_scrap_reserve": "never spend your liquid balance below this",
+  "spend.min_stash_hours": "fixed before anything else: a full stash stops all attacking",
+  "spend.max_per_cycle": "0 = no cap on purchases per cycle",
+  "spend.engineering.weight": "share of the rotation — the only goal that compounds",
+  "spend.engineering.max_payback_days": "stop once a point takes longer than this to mine back its cost",
+  "spend.engineering.max_level": "0 disables the cap",
+  "spend.favor.weight": "share of the rotation — buys critical-hit chance",
+  "spend.favor.max_scrap_per_crit_point": "stop when one more percent of crit costs more than this",
+  "spend.favor.max_crit": "0 disables the cap",
+  "spend.stake.weight": "share of the rotation — staking is not spending, the SCRAP stays yours",
+  "spend.stake.max_scrap_per_dodge_point": "stop chasing dodge past this price",
+  "spend.stake.absorb_surplus": "off keeps leftovers liquid so they accumulate into the next purchase",
+  "spend.stake.max_stake": "0 disables the cap",
+  "spend.damage.enabled": "bought only when the board is actually out of reach",
+  "spend.damage.min_unreachable_percent": "how much of the battle board must be unreachable first",
+  "spend.damage.max_level": "0 disables the cap",
+  "spend.damage.max_defense": "0 disables the cap",
 };
 
 const state = {
@@ -375,12 +388,8 @@ function renderSettings() {
     const redraw = () => {
       body.replaceChildren(
         ...Object.keys(draft).map((section) =>
-          el("fieldset", {},
-            el("legend", { text: section }),
-            ...Object.keys(draft[section]).map((key) =>
-              fieldFor(section, key, draft, defaults, account.writable, redraw)),
-          ),
-        ),
+          groupFor([section], draft[section], (defaults || {})[section] || {},
+                   account.writable, redraw)),
       );
     };
     redraw();
@@ -420,12 +429,28 @@ function renderSettings() {
   });
 }
 
-function fieldFor(section, key, draft, defaults, writable, redraw) {
-  const path = `${section}.${key}`;
-  const value = draft[section][key];
-  const fallback = defaults[section] ? defaults[section][key] : undefined;
+// A plain object is a group of settings; an array is a single list-valued setting.
+const isGroup = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+
+// Settings are not flat — `spend` holds a table per goal — so groups nest. Rendering
+// only the top level turned each goal into one broken number input.
+function groupFor(parts, node, defaultsNode, writable, redraw) {
+  const children = Object.keys(node).map((key) =>
+    isGroup(node[key])
+      ? groupFor([...parts, key], node[key], (defaultsNode || {})[key] || {}, writable, redraw)
+      : fieldFor([...parts, key], node, defaultsNode, writable, redraw));
+  return el("fieldset", { class: parts.length > 1 ? "nested" : "" },
+    el("legend", { text: parts.length > 1 ? parts.slice(1).join(" · ") : parts[0] }),
+    ...children);
+}
+
+function fieldFor(parts, node, defaultsNode, writable, redraw) {
+  const key = parts[parts.length - 1];
+  const path = parts.join(".");
+  const value = node[key];
+  const fallback = (defaultsNode || {})[key];
   const changed = JSON.stringify(value) !== JSON.stringify(fallback);
-  const set = (v) => { draft[section][key] = v; redraw(); };
+  const set = (v) => { node[key] = v; redraw(); };
 
   let input;
   if (CHOICES[path]) {

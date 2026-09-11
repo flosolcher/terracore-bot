@@ -225,7 +225,7 @@ pub struct Settings {
     pub claim: ClaimSettings,
     pub quest: QuestSettings,
     pub boss: BossSettings,
-    pub upgrade: UpgradeSettings,
+    pub spend: SpendSettings,
 }
 
 impl Settings {
@@ -244,8 +244,8 @@ impl Settings {
         if self.quest.enabled && self.quest.collect {
             actions.push("quests");
         }
-        if self.upgrade.enabled {
-            actions.push("upgrade");
+        if self.spend.enabled {
+            actions.push("spend");
         }
         if self.boss.enabled {
             actions.push("boss");
@@ -256,7 +256,7 @@ impl Settings {
     /// Whether anything enabled here moves Hive-Engine tokens, and so cannot run
     /// without an active key in the wallet.
     pub fn needs_active_key(&self) -> bool {
-        self.boss.enabled || self.upgrade.enabled
+        self.boss.enabled || self.spend.enabled
     }
 }
 
@@ -392,51 +392,161 @@ pub enum BossOrder {
     Listed,
 }
 
-/// Upgrades burn SCRAP through Hive-Engine, so they need an **active** key.
+/// How surplus SCRAP is divided between the things it can be spent on.
+///
+/// Not a waterfall: a waterfall pours everything into whichever goal comes first and
+/// the others never move. Each cycle the spendable balance is split by `weight`, so
+/// all three advance together, and a goal that has reached its ceiling hands its
+/// share back to the rest rather than wasting it.
+///
+/// The one thing outside the rotation is `min_stash_hours`. A full stash stops the
+/// bot attacking at all, so it is a need rather than a preference and is fixed first.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
-pub struct UpgradeSettings {
+pub struct SpendSettings {
     pub enabled: bool,
-    /// Which stats to buy, in preference order when `order = "listed"`.
-    pub stats: Vec<Stat>,
-    /// `cheapest` buys the lowest-cost eligible upgrade first, `listed` follows
-    /// `stats`.
-    pub order: UpgradeOrder,
-    /// Never spend liquid SCRAP below this balance.
+    /// Never spend liquid SCRAP below this.
     pub min_scrap_reserve: f64,
-    /// Refuse any single upgrade costing more than this. 0 disables the cap.
-    pub max_cost: f64,
-    pub max_per_cycle: u32,
-    /// Stop upgrading a stat once it reaches this value. 0 disables the cap.
-    /// Engineering above 333 is softcapped by the game at half rate.
-    pub max_engineering: f64,
-    pub max_damage: f64,
-    pub max_defense: f64,
+    /// Stake enough to hold this many hours of mining before anything else is
+    /// considered. 0 disables the check.
+    pub min_stash_hours: f64,
+    pub engineering: EngineeringGoal,
+    pub favor: FavorGoal,
+    pub stake: StakeGoal,
+    /// Damage and defense, bought only on evidence -- see `DamageGoal`.
+    pub damage: DamageGoal,
     pub delay_secs: u64,
+    /// Purchases per cycle across all goals. 0 means no cap.
+    pub max_per_cycle: u32,
 }
 
-impl Default for UpgradeSettings {
+impl Default for SpendSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            stats: vec![Stat::Engineering],
-            order: UpgradeOrder::Cheapest,
             min_scrap_reserve: 0.0,
-            max_cost: 0.0,
-            max_per_cycle: 1,
-            max_engineering: 0.0,
-            max_damage: 0.0,
-            max_defense: 0.0,
+            min_stash_hours: 12.0,
+            engineering: EngineeringGoal::default(),
+            favor: FavorGoal::default(),
+            stake: StakeGoal::default(),
+            damage: DamageGoal::default(),
             delay_secs: 10,
+            max_per_cycle: 0,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum UpgradeOrder {
-    Cheapest,
-    Listed,
+/// Engineering is the only goal that compounds: it raises mining income, which pays
+/// for everything else. Below the game's 333 softcap the payback in days is very
+/// close to the current level, so the ceiling is expressed in days.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EngineeringGoal {
+    pub enabled: bool,
+    pub weight: f64,
+    /// Stop once a point takes longer than this to mine back its own cost.
+    pub max_payback_days: f64,
+    /// Hard ceiling on the stat. 0 disables it.
+    pub max_level: f64,
+}
+
+impl Default for EngineeringGoal {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            weight: 3.0,
+            max_payback_days: 60.0,
+            max_level: 0.0,
+        }
+    }
+}
+
+/// Favor buys critical-hit chance and is burned for good. Its cost is flat within a
+/// band and doubles at every band edge, so a ceiling on the *marginal* price stops
+/// exactly at the next cliff -- which a target percentage cannot do, because the
+/// cliff moves as the account grows.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FavorGoal {
+    pub enabled: bool,
+    pub weight: f64,
+    /// Stop once one more percent of crit costs more than this.
+    pub max_scrap_per_crit_point: f64,
+    /// Hard ceiling on crit. 0 disables it.
+    pub max_crit: f64,
+}
+
+impl Default for FavorGoal {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            weight: 1.0,
+            max_scrap_per_crit_point: 100_000.0,
+            max_crit: 0.0,
+        }
+    }
+}
+
+/// Staking is not spending: the SCRAP stays yours. It raises dodge, luck and the
+/// stash ceiling, so it is the natural home for anything the other goals cannot
+/// justify -- at the cost of the unstaking cooldown.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct StakeGoal {
+    pub enabled: bool,
+    pub weight: f64,
+    /// Stop chasing dodge once a point of it costs more than this. Staking past
+    /// that still buys stash, which `absorb_surplus` decides on.
+    pub max_scrap_per_dodge_point: f64,
+    /// Put whatever the other goals could not use into stake. Off by default: the
+    /// leftover otherwise stays liquid and accumulates, which is what lets an
+    /// expensive engineering point eventually become affordable.
+    pub absorb_surplus: bool,
+    /// Hard ceiling on total stake. 0 disables it.
+    pub max_stake: f64,
+}
+
+impl Default for StakeGoal {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            weight: 2.0,
+            max_scrap_per_dodge_point: 50_000.0,
+            absorb_surplus: false,
+            max_stake: 0.0,
+        }
+    }
+}
+
+/// Damage widens the set of players you can attack and defense narrows the set that
+/// can attack you. Neither is bought on a schedule: damage is bought only when the
+/// battle board says targets are actually out of reach, which the bot already counts.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DamageGoal {
+    pub enabled: bool,
+    pub weight: f64,
+    /// Buy damage only while at least this percentage of the board is unreachable.
+    pub min_unreachable_percent: f64,
+    pub max_level: f64,
+    /// Defense is never bought on evidence the bot has, so it is opt-in and capped.
+    pub defense_enabled: bool,
+    pub defense_weight: f64,
+    pub max_defense: f64,
+}
+
+impl Default for DamageGoal {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            weight: 1.0,
+            min_unreachable_percent: 20.0,
+            max_level: 0.0,
+            defense_enabled: false,
+            defense_weight: 1.0,
+            max_defense: 0.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -593,8 +703,18 @@ fn validate_account(name: &str, s: &Settings) -> Result<()> {
     if s.attack.candidate_limit == 0 {
         bail!("[accounts.{name}.attack] candidate_limit must be at least 1");
     }
-    if s.upgrade.enabled && s.upgrade.stats.is_empty() {
-        bail!("[accounts.{name}.upgrade] enabled with an empty `stats` list");
+    if s.spend.enabled {
+        let w = &s.spend;
+        let any = (w.engineering.enabled && w.engineering.weight > 0.0)
+            || (w.favor.enabled && w.favor.weight > 0.0)
+            || (w.stake.enabled && w.stake.weight > 0.0)
+            || (w.damage.enabled && w.damage.weight > 0.0);
+        if !any {
+            bail!("[accounts.{name}.spend] is enabled but every goal is off or has weight 0");
+        }
+        if w.min_stash_hours < 0.0 {
+            bail!("[accounts.{name}.spend] min_stash_hours cannot be negative");
+        }
     }
     if s.boss.order == BossOrder::Listed && s.boss.enabled && s.boss.planets.is_empty() {
         bail!("[accounts.{name}.boss] order = \"listed\" needs a non-empty `planets` list");
@@ -683,7 +803,7 @@ max_enemy_dodge = 5.0
     fn active_key_actions_are_off_unless_asked_for() {
         let cfg = Config::from_str("[accounts.alice]\n").unwrap();
         assert!(!cfg.accounts[0].settings.boss.enabled);
-        assert!(!cfg.accounts[0].settings.upgrade.enabled);
+        assert!(!cfg.accounts[0].settings.spend.enabled);
     }
 
     #[test]
@@ -740,15 +860,15 @@ max_enemy_dodge = 5.0
         assert!(s.needs_active_key());
         assert!(s.enabled_actions().contains(&"boss"));
 
-        s.upgrade.enabled = true;
+        s.spend.enabled = true;
         s.attack.enabled = false;
         s.claim.enabled = false;
-        assert_eq!(s.enabled_actions(), ["upgrade", "boss"]);
+        assert_eq!(s.enabled_actions(), ["spend", "boss"]);
 
         // Each of the two token-spending actions is enough on its own.
-        let mut only_upgrade = Settings::default();
-        only_upgrade.upgrade.enabled = true;
-        assert!(only_upgrade.needs_active_key());
+        let mut only_spend = Settings::default();
+        only_spend.spend.enabled = true;
+        assert!(only_spend.needs_active_key());
         let mut only_boss = Settings::default();
         only_boss.boss.enabled = true;
         assert!(only_boss.needs_active_key());
