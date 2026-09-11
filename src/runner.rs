@@ -265,6 +265,15 @@ impl Bot {
             stop: Arc::clone(&self.stop),
         };
 
+        // Consumables go first. The game queues custom_json, so a potion used now is
+        // not visible for a while -- it buys attacks for the next cycle rather than
+        // this one. Which is exactly why it should not wait: run it last and the
+        // potion lands a whole cycle later still.
+        match runner.use_consumables(&player) {
+            Ok(outcome) => self.note("consumables", &account.name, &outcome, &mut report),
+            Err(e) => self.note_failure("consumables", &account.name, &e, &mut report),
+        }
+
         // A full stash makes every attack pointless, so empty it first. The rest of
         // the ordering is: fight, bank what was won, then spend.
         if account.settings.claim.claim_when_stash_full
@@ -306,24 +315,33 @@ impl Bot {
             Err(e) => self.note_failure("quests", &account.name, &e, &mut report),
         }
 
-        // Consumables before the rest: one of them may hand back the attacks or the
-        // claim that the actions after it are waiting on.
-        match runner.use_consumables(&player) {
-            Ok(outcome) => self.note("consumables", &account.name, &outcome, &mut report),
-            Err(e) => self.note_failure("consumables", &account.name, &e, &mut report),
-        }
-
         match runner.open_crates() {
             Ok(outcome) => self.note("crates", &account.name, &outcome, &mut report),
             Err(e) => self.note_failure("crates", &account.name, &e, &mut report),
         }
 
+        // Both of the next two spend liquid SCRAP, and the game will still be
+        // reporting the pre-mission balance when the second one asks. Carrying what
+        // was already committed across is what stops them promising the same SCRAP
+        // twice and having the second lot rejected on-chain.
+        let mut committed = 0.0;
         match runner.start_missions(&player) {
-            Ok(outcome) => self.note("missions", &account.name, &outcome, &mut report),
+            Ok(outcome) => {
+                committed += outcome.spent;
+                self.note("missions", &account.name, &outcome, &mut report);
+            }
             Err(e) => self.note_failure("missions", &account.name, &e, &mut report),
         }
 
-        match runner.spend(&player) {
+        if committed > 0.0 {
+            info!(
+                account = %account.name,
+                committed = format!("{committed:.0}"),
+                "already committed this cycle; spending sees the reduced balance"
+            );
+        }
+
+        match runner.spend(&player, committed) {
             Ok(outcome) => self.note("spend", &account.name, &outcome, &mut report),
             Err(e) => self.note_failure("spend", &account.name, &e, &mut report),
         }

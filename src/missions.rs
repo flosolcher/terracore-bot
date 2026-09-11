@@ -223,6 +223,75 @@ pub fn blocked(
     None
 }
 
+/// The board slots worth starting, best first, plus why each of the rest was not.
+///
+/// Everything the choice depends on lives here rather than in the action: the
+/// settings filters used to sit in the broadcasting function where no test could
+/// reach them, and mutation testing duly found that removing the tier range and the
+/// cost cap changed nothing any test could see.
+pub fn select<'a>(
+    board: &'a crate::api::QuestBoard,
+    today: &str,
+    player: &Player,
+    items: &Items,
+    running: &[Quest],
+    s: &crate::config::QuestSettings,
+    spendable: f64,
+) -> (Vec<&'a BoardSlot>, Vec<String>) {
+    let mut candidates: Vec<&BoardSlot> = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
+
+    for slot in &board.slots {
+        let tier = slot.tier.round() as u8;
+        if tier < s.min_tier || tier > s.max_tier {
+            continue;
+        }
+        if !s.types.is_empty() && !s.types.iter().any(|t| t == &slot.quest_type) {
+            continue;
+        }
+        if s.max_scrap_per_mission > 0.0 && slot.scrap_cost > s.max_scrap_per_mission {
+            refused.push(format!(
+                "t{tier} {}: costs {:.0}, over max_scrap_per_mission",
+                slot.quest_type, slot.scrap_cost
+            ));
+            continue;
+        }
+        match blocked(slot, &board.date, today, player, items, running, spendable) {
+            None => candidates.push(slot),
+            Some(reason) => refused.push(format!(
+                "t{tier} {}: {}",
+                slot.quest_type,
+                reason.describe()
+            )),
+        }
+    }
+
+    let cmp = |a: &&BoardSlot, b: &&BoardSlot| match s.order {
+        crate::config::MissionOrder::HighestTier => b
+            .tier
+            .partial_cmp(&a.tier)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        crate::config::MissionOrder::Cheapest => a
+            .scrap_cost
+            .partial_cmp(&b.scrap_cost)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        crate::config::MissionOrder::BestValue => {
+            let value = |m: &BoardSlot| {
+                if m.scrap_cost > 0.0 {
+                    m.base_rolls / m.scrap_cost
+                } else {
+                    f64::INFINITY
+                }
+            };
+            value(b)
+                .partial_cmp(&value(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }
+    };
+    candidates.sort_by(cmp);
+    (candidates, refused)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,5 +596,155 @@ mod tests {
         assert_eq!(today_utc(1_709_164_800_000), "2024-02-29");
         // And the day after it.
         assert_eq!(today_utc(1_709_251_200_000), "2024-03-01");
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    //! The filters and the ordering, which used to live in the broadcasting
+    //! function where no test could reach them.
+    use super::*;
+    use crate::api::QuestBoard;
+    use crate::config::{MissionOrder, QuestSettings, Settings};
+
+    const TODAY: &str = "2026-09-11";
+
+    fn board(slots: &[(&str, f64, f64, f64)]) -> QuestBoard {
+        QuestBoard {
+            date: TODAY.into(),
+            slots: slots
+                .iter()
+                .map(|(kind, tier, cost, rolls)| BoardSlot {
+                    quest_type: (*kind).into(),
+                    tier: *tier,
+                    scrap_cost: *cost,
+                    base_rolls: *rolls,
+                    name: format!("t{tier} {kind}"),
+                    ..Default::default()
+                })
+                .collect(),
+        }
+    }
+
+    /// Strong enough for anything on the board, so only the settings filters bite.
+    fn strong() -> Player {
+        Player {
+            level: 100.0,
+            stats: crate::api::Stats {
+                damage: 100_000.0,
+                engineering: 100_000.0,
+                defense: 100_000.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn geared() -> Items {
+        let item = crate::api::Item {
+            item_number: Some(1),
+            ..Default::default()
+        };
+        Items {
+            avatar: item.clone(),
+            weapon: item.clone(),
+            armor: item.clone(),
+            ship: item.clone(),
+            special: item,
+        }
+    }
+
+    fn settings() -> QuestSettings {
+        let mut s = Settings::default().quest;
+        s.start = true;
+        s
+    }
+
+    fn names(picked: &[&BoardSlot]) -> Vec<String> {
+        picked.iter().map(|s| s.name.clone()).collect()
+    }
+
+    #[test]
+    fn the_tier_range_is_respected() {
+        let b = board(&[
+            ("combat", 1.0, 10.0, 2.0),
+            ("combat", 3.0, 30.0, 4.0),
+            ("combat", 5.0, 50.0, 8.0),
+        ]);
+        let mut s = settings();
+        s.min_tier = 2;
+        s.max_tier = 4;
+        let (picked, _) = select(&b, TODAY, &strong(), &geared(), &[], &s, 1e9);
+        assert_eq!(names(&picked), ["t3 combat"], "only tier 3 is inside 2..=4");
+    }
+
+    #[test]
+    fn the_cost_cap_is_respected_and_says_so() {
+        let b = board(&[("combat", 1.0, 100.0, 2.0), ("combat", 1.0, 5000.0, 2.0)]);
+        let mut s = settings();
+        s.max_scrap_per_mission = 1000.0;
+        let (picked, refused) = select(&b, TODAY, &strong(), &geared(), &[], &s, 1e9);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].scrap_cost, 100.0);
+        assert!(
+            refused.iter().any(|r| r.contains("max_scrap_per_mission")),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn the_type_filter_is_respected() {
+        let b = board(&[("combat", 1.0, 10.0, 2.0), ("salvage", 1.0, 10.0, 2.0)]);
+        let mut s = settings();
+        s.types = vec!["salvage".into()];
+        let (picked, _) = select(&b, TODAY, &strong(), &geared(), &[], &s, 1e9);
+        assert_eq!(names(&picked), ["t1 salvage"]);
+    }
+
+    #[test]
+    fn each_ordering_picks_a_different_mission_first() {
+        // Cheap-but-poor, dear-but-rich, and the best rolls per SCRAP.
+        let b = board(&[
+            ("combat", 1.0, 100.0, 2.0),   // 0.0200 rolls/scrap
+            ("combat", 5.0, 5000.0, 10.0), // 0.0020 rolls/scrap, highest tier
+            ("combat", 2.0, 200.0, 9.0),   // 0.0450 rolls/scrap, best value
+        ]);
+        let mut s = settings();
+
+        s.order = MissionOrder::Cheapest;
+        let (picked, _) = select(&b, TODAY, &strong(), &geared(), &[], &s, 1e9);
+        assert_eq!(picked[0].scrap_cost, 100.0, "cheapest first");
+
+        s.order = MissionOrder::HighestTier;
+        let (picked, _) = select(&b, TODAY, &strong(), &geared(), &[], &s, 1e9);
+        assert_eq!(picked[0].tier, 5.0, "highest tier first");
+
+        s.order = MissionOrder::BestValue;
+        let (picked, _) = select(&b, TODAY, &strong(), &geared(), &[], &s, 1e9);
+        assert_eq!(picked[0].base_rolls, 9.0, "most rolls per SCRAP first");
+    }
+
+    #[test]
+    fn a_filtered_out_mission_is_not_reported_as_refused() {
+        // Out of the tier range is a choice, not a refusal -- listing it would bury
+        // the reasons that actually need acting on.
+        let b = board(&[("combat", 5.0, 10.0, 2.0)]);
+        let mut s = settings();
+        s.max_tier = 2;
+        let (picked, refused) = select(&b, TODAY, &strong(), &geared(), &[], &s, 1e9);
+        assert!(picked.is_empty());
+        assert!(refused.is_empty(), "{refused:?}");
+    }
+
+    #[test]
+    fn the_games_own_gates_still_apply_inside_the_filters() {
+        let b = board(&[("combat", 4.0, 10.0, 2.0)]);
+        let weak = Player {
+            level: 10.0,
+            ..strong()
+        };
+        let (picked, refused) = select(&b, TODAY, &weak, &geared(), &[], &settings(), 1e9);
+        assert!(picked.is_empty());
+        assert!(refused[0].contains("level 50"), "{refused:?}");
     }
 }

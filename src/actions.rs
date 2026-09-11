@@ -15,7 +15,7 @@ use serde_json::json;
 use tracing::{debug, info, warn};
 
 use crate::api::{format_number, now_ms, Api, Player, Quest};
-use crate::config::{BossOrder, MissionOrder, Settings, SpendSettings, Stat};
+use crate::config::{BossOrder, Settings, SpendSettings, Stat};
 use crate::curves;
 use crate::hive::{tx_hash, Auth, Broadcaster};
 use crate::keys::AccountKeys;
@@ -40,6 +40,13 @@ pub struct Runner<'a> {
 pub struct Outcome {
     pub performed: u32,
     pub skipped_reason: Option<String>,
+    /// Liquid SCRAP this action committed.
+    ///
+    /// The game processes custom_json through a queue, so the API still reports the
+    /// old balance for a while afterwards. Anything later in the same cycle that
+    /// also spends SCRAP has to subtract this, or the two commit the same balance
+    /// twice and the second one is simply rejected on-chain.
+    pub spent: f64,
 }
 
 impl Outcome {
@@ -47,6 +54,7 @@ impl Outcome {
         Self {
             performed: 0,
             skipped_reason: Some(reason.into()),
+            spent: 0.0,
         }
     }
 
@@ -54,6 +62,15 @@ impl Outcome {
         Self {
             performed: n,
             skipped_reason: None,
+            spent: 0.0,
+        }
+    }
+
+    fn did_spending(n: u32, spent: f64) -> Self {
+        Self {
+            performed: n,
+            skipped_reason: None,
+            spent,
         }
     }
 }
@@ -379,62 +396,15 @@ impl Runner<'_> {
         let running = self.api.quests(self.account).unwrap_or_default();
 
         let mut spendable = (player.hive_engine_scrap - s.min_scrap_reserve).max(0.0);
-        let mut candidates: Vec<&crate::api::BoardSlot> = Vec::new();
-        let mut refused: Vec<String> = Vec::new();
-
-        for slot in &board.slots {
-            let tier = slot.tier.round() as u8;
-            if tier < s.min_tier || tier > s.max_tier {
-                continue;
-            }
-            if !s.types.is_empty() && !s.types.iter().any(|t| t == &slot.quest_type) {
-                continue;
-            }
-            if s.max_scrap_per_mission > 0.0 && slot.scrap_cost > s.max_scrap_per_mission {
-                continue;
-            }
-            match missions::blocked(
-                slot,
-                &board.date,
-                &today,
-                player,
-                &player.items,
-                &running,
-                spendable,
-            ) {
-                None => candidates.push(slot),
-                Some(reason) => refused.push(format!(
-                    "t{tier} {}: {}",
-                    slot.quest_type,
-                    reason.describe()
-                )),
-            }
-        }
-
-        match s.order {
-            MissionOrder::HighestTier => candidates.sort_by(|a, b| {
-                b.tier
-                    .partial_cmp(&a.tier)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }),
-            MissionOrder::Cheapest => candidates.sort_by(|a, b| {
-                a.scrap_cost
-                    .partial_cmp(&b.scrap_cost)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }),
-            MissionOrder::BestValue => candidates.sort_by(|a, b| {
-                let value = |m: &crate::api::BoardSlot| {
-                    if m.scrap_cost > 0.0 {
-                        m.base_rolls / m.scrap_cost
-                    } else {
-                        f64::INFINITY
-                    }
-                };
-                value(b)
-                    .partial_cmp(&value(a))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }),
-        }
+        let (candidates, refused) = missions::select(
+            &board,
+            &today,
+            player,
+            &player.items,
+            &running,
+            s,
+            spendable,
+        );
 
         if candidates.is_empty() {
             return Ok(Outcome::skipped(if refused.is_empty() {
@@ -445,6 +415,7 @@ impl Runner<'_> {
         }
 
         let mut done = 0;
+        let mut committed = 0.0;
         for slot in candidates {
             if self.stopping() {
                 break;
@@ -481,10 +452,11 @@ impl Runner<'_> {
                 "started mission",
             );
             spendable -= slot.scrap_cost;
+            committed += slot.scrap_cost;
             done += 1;
             self.wait(s.delay_secs);
         }
-        Ok(Outcome::did(done))
+        Ok(Outcome::did_spending(done, committed))
     }
 
     /// Open crates. Free, and a posting key is enough.
@@ -549,36 +521,14 @@ impl Runner<'_> {
             .inventory(self.account)
             .context("reading the inventory")?;
 
-        // What is actually blocked at this moment.
-        let out_of_attacks = player.attacks < 1.0;
-        let out_of_claims = player.claims < 1.0;
-        let stash_full = player.stash_is_full();
-        let could_use_attacks = out_of_attacks && !stash_full && player.claims >= 1.0;
-        let could_use_claims = out_of_claims && player.scrap >= self.settings.claim.min_scrap;
+        let (wanted, skipped) =
+            consumables_to_use(player, &inventory, s, self.settings.claim.min_scrap);
 
         let mut done = 0;
-        let mut skipped: Vec<String> = Vec::new();
-
-        for item in &inventory.consumables {
-            if self.stopping() || (s.max_per_cycle > 0 && done >= s.max_per_cycle) {
+        for item in wanted {
+            if self.stopping() {
                 break;
             }
-            let kind = item.short_name().to_string();
-            if item.amount < 1.0 || !s.use_kinds.iter().any(|k| k == &kind) {
-                continue;
-            }
-            let unblocks = match kind.as_str() {
-                "attack" | "fury" => could_use_attacks,
-                "claim" => could_use_claims,
-                // Everything else is a timed buff. Burning one on a schedule wastes
-                // most of it, so the bot leaves those to you.
-                _ => false,
-            };
-            if !unblocks {
-                skipped.push(format!("{kind} would be wasted right now"));
-                continue;
-            }
-
             let sent = self.hive.custom_json(
                 self.account,
                 &self.keys.posting,
@@ -762,7 +712,11 @@ impl Runner<'_> {
     /// The decision is [`plan`], which is pure; this only carries it out. Splitting
     /// them is what makes the rotation testable at all -- the policy is the subtle
     /// part and broadcasting is not.
-    pub fn spend(&self, player: &Player) -> Result<Outcome> {
+    /// `already_committed` is liquid SCRAP this cycle has spent but the game has
+    /// not processed yet -- missions, most often. It is a parameter rather than
+    /// something the caller subtracts beforehand so that forgetting it is a
+    /// compile error instead of two actions quietly promising the same balance.
+    pub fn spend(&self, player: &Player, already_committed: f64) -> Result<Outcome> {
         let s = &self.settings.spend;
         if !s.enabled {
             return Ok(Outcome::skipped("spending is disabled"));
@@ -773,7 +727,7 @@ impl Runner<'_> {
         };
 
         let wallet = Wallet {
-            liquid: player.hive_engine_scrap,
+            liquid: (player.hive_engine_scrap - already_committed.max(0.0)).max(0.0),
             stake: player.hive_engine_stake,
             favor: player.favor,
             engineering: player.engineering,
@@ -788,10 +742,16 @@ impl Runner<'_> {
         }
 
         let mut done = 0;
+        let mut committed = 0.0;
         for step in &steps {
             if self.stopping() {
                 break;
             }
+            committed += match step {
+                Step::Stake { amount, .. } | Step::Favor { amount } | Step::Stat { amount, .. } => {
+                    *amount
+                }
+            };
             match step {
                 Step::Stake { amount, why } => self.stake(active, *amount, why)?,
                 Step::Favor { amount } => self.burn(
@@ -808,7 +768,7 @@ impl Runner<'_> {
             done += 1;
             self.wait(s.delay_secs);
         }
-        Ok(Outcome::did(done))
+        Ok(Outcome::did_spending(done, committed))
     }
 
     /// What share of the battle board this account cannot reach, if damage buying
@@ -943,7 +903,7 @@ mod tests {
     /// Wired to a port nothing listens on. Every assertion below is about a decision
     /// taken *before* any request, so a test that started reaching the network would
     /// fail or hang rather than quietly pass.
-    fn parts(active: Option<PrivateKey>) -> (Api, Broadcaster, AccountKeys) {
+    pub(super) fn parts(active: Option<PrivateKey>) -> (Api, Broadcaster, AccountKeys) {
         let api = Api::new("http://127.0.0.1:9", Duration::from_millis(50), 0);
         let hive = Broadcaster::new(
             vec!["http://127.0.0.1:9".into()],
@@ -995,7 +955,7 @@ mod tests {
             boss.skipped_reason
         );
 
-        let upgrade = runner.spend(&Player::default()).unwrap();
+        let upgrade = runner.spend(&Player::default(), 0.0).unwrap();
         assert_eq!(upgrade.performed, 0);
         assert!(
             upgrade
@@ -1026,7 +986,7 @@ mod tests {
             hive_engine_scrap: 0.0,
             ..Default::default()
         };
-        let outcome = runner.spend(&player).unwrap();
+        let outcome = runner.spend(&player, 0.0).unwrap();
         assert_eq!(outcome.performed, 0);
         let reason = outcome.skipped_reason.unwrap_or_default();
         assert!(!reason.contains("active key"), "{reason}");
@@ -1186,6 +1146,51 @@ mod tests {
             .unwrap_or_default();
         assert!(reason.contains("disabled"), "{reason}");
     }
+}
+
+/// Which consumables are worth using right now, and why the rest are not.
+///
+/// Pure, because this is entirely a judgement call and the judgement is the part
+/// worth testing: a potion used at the wrong moment is not an error anywhere, it is
+/// simply gone. The rule is that a charge is spent only when the thing it grants is
+/// the thing currently missing.
+pub fn consumables_to_use<'a>(
+    player: &Player,
+    inventory: &'a crate::api::Inventory,
+    s: &crate::config::ConsumableSettings,
+    claim_min_scrap: f64,
+) -> (Vec<&'a crate::api::Consumable>, Vec<String>) {
+    // More attacks are worth having only if an attack could actually be made: room
+    // in the stash for the loot, and a claim available to collect it.
+    let could_use_attacks = player.attacks < 1.0 && !player.stash_is_full() && player.claims >= 1.0;
+    // A claim charge is worth having only if there is something to claim.
+    let could_use_claims = player.claims < 1.0 && player.scrap >= claim_min_scrap;
+
+    let mut wanted = Vec::new();
+    let mut skipped = Vec::new();
+
+    for item in &inventory.consumables {
+        if s.max_per_cycle > 0 && wanted.len() >= s.max_per_cycle as usize {
+            break;
+        }
+        let kind = item.short_name();
+        if item.amount < 1.0 || !s.use_kinds.iter().any(|k| k == kind) {
+            continue;
+        }
+        let unblocks = match kind {
+            "attack" | "fury" => could_use_attacks,
+            "claim" => could_use_claims,
+            // Everything else is a timed buff. Burning a 24-hour buff on a schedule
+            // wastes most of it, so those are left to a person to decide.
+            _ => false,
+        };
+        if unblocks {
+            wanted.push(item);
+        } else {
+            skipped.push(format!("{kind} would be wasted right now"));
+        }
+    }
+    (wanted, skipped)
 }
 
 /// One thing the bot has decided to do with SCRAP.
@@ -1807,5 +1812,294 @@ mod plan_audit {
             };
             assert!(amount.is_finite() && amount > 0.0, "bad amount in {step:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod consumable_tests {
+    //! A potion used at the wrong moment is not an error anywhere -- it is simply
+    //! gone -- so the judgement is what these test.
+    use super::tests::parts;
+    use super::*;
+    use crate::api::{Consumable, Inventory, Player};
+    use crate::config::{ConsumableSettings, Settings};
+
+    /// The same throwaway wiring the other test module uses, without the macro,
+    /// which `macro_rules!` scoping keeps inside its own module.
+    fn runner_for<'a>(
+        api: &'a Api,
+        hive: &'a Broadcaster,
+        keys: &'a AccountKeys,
+        settings: &'a Settings,
+        blacklist: &'a HashSet<String>,
+    ) -> Runner<'a> {
+        Runner {
+            api,
+            hive,
+            account: "alice",
+            keys,
+            settings,
+            blacklist,
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn held(kinds: &[(&str, f64)]) -> Inventory {
+        Inventory {
+            crates: Vec::new(),
+            consumables: kinds
+                .iter()
+                .map(|(k, amount)| Consumable {
+                    kind: format!("{k}_consumable"),
+                    amount: *amount,
+                })
+                .collect(),
+        }
+    }
+
+    /// Out of attacks, with room to loot and a claim in hand: an attack potion is
+    /// exactly what is missing.
+    fn attack_starved() -> Player {
+        Player {
+            attacks: 0.0,
+            claims: 3.0,
+            scrap: 10.0,
+            hive_engine_stake: 10_000.0,
+            ..Default::default()
+        }
+    }
+
+    fn settings() -> ConsumableSettings {
+        let mut s = Settings::default().consumables;
+        s.enabled = true;
+        s
+    }
+
+    #[test]
+    fn an_attack_potion_is_used_only_when_attacks_are_what_is_missing() {
+        let s = settings();
+        let inventory = held(&[("attack", 2.0), ("fury", 1.0)]);
+
+        let (wanted, _) = consumables_to_use(&attack_starved(), &inventory, &s, 0.1);
+        assert_eq!(
+            wanted.len(),
+            2,
+            "both grant attacks and attacks are missing"
+        );
+
+        // With attacks already in hand, drinking one throws it away.
+        let stocked = Player {
+            attacks: 5.0,
+            ..attack_starved()
+        };
+        let (wanted, skipped) = consumables_to_use(&stocked, &inventory, &s, 0.1);
+        assert!(wanted.is_empty(), "{wanted:?}");
+        assert_eq!(skipped.len(), 2);
+        assert!(skipped[0].contains("wasted"), "{skipped:?}");
+    }
+
+    #[test]
+    fn attacks_are_worthless_without_somewhere_to_put_the_loot() {
+        let s = settings();
+        let inventory = held(&[("fury", 1.0)]);
+
+        // Stash full: an attack cannot be made whatever the attack count says.
+        let full = Player {
+            scrap: 10_001.0,
+            hive_engine_stake: 10_000.0,
+            ..attack_starved()
+        };
+        assert!(full.stash_is_full());
+        assert!(consumables_to_use(&full, &inventory, &s, 0.1).0.is_empty());
+
+        // No claims: the game refuses the battle anyway.
+        let claimless = Player {
+            claims: 0.0,
+            ..attack_starved()
+        };
+        assert!(consumables_to_use(&claimless, &inventory, &s, 0.1)
+            .0
+            .is_empty());
+    }
+
+    #[test]
+    fn a_claim_potion_needs_something_worth_claiming() {
+        let s = settings();
+        let inventory = held(&[("claim", 1.0)]);
+
+        // Out of claims with scrap sitting in the stash: useful.
+        let blocked = Player {
+            claims: 0.0,
+            scrap: 500.0,
+            ..attack_starved()
+        };
+        assert_eq!(consumables_to_use(&blocked, &inventory, &s, 0.1).0.len(), 1);
+
+        // Out of claims but nothing to claim: pointless.
+        let empty = Player {
+            claims: 0.0,
+            scrap: 0.0,
+            ..attack_starved()
+        };
+        assert!(consumables_to_use(&empty, &inventory, &s, 0.1).0.is_empty());
+    }
+
+    #[test]
+    fn timed_buffs_are_never_used_on_a_schedule() {
+        // Even listed explicitly, a 24-hour buff is left alone: the bot has no idea
+        // whether now is a good moment to start its clock.
+        let mut s = settings();
+        s.use_kinds = vec![
+            "crit".into(),
+            "rage".into(),
+            "protection".into(),
+            "damage".into(),
+        ];
+        let inventory = held(&[
+            ("crit", 5.0),
+            ("rage", 5.0),
+            ("protection", 5.0),
+            ("damage", 5.0),
+        ]);
+        let (wanted, skipped) = consumables_to_use(&attack_starved(), &inventory, &s, 0.1);
+        assert!(wanted.is_empty(), "{wanted:?}");
+        assert_eq!(skipped.len(), 4);
+    }
+
+    #[test]
+    fn nothing_outside_the_configured_list_is_touched() {
+        let mut s = settings();
+        s.use_kinds = vec!["claim".into()];
+        let inventory = held(&[("fury", 3.0), ("attack", 3.0)]);
+        let (wanted, skipped) = consumables_to_use(&attack_starved(), &inventory, &s, 0.1);
+        assert!(wanted.is_empty());
+        // Not even mentioned as skipped: it was never a candidate.
+        assert!(skipped.is_empty(), "{skipped:?}");
+    }
+
+    #[test]
+    fn an_empty_stack_is_not_drunk() {
+        let s = settings();
+        let inventory = held(&[("fury", 0.0)]);
+        assert!(consumables_to_use(&attack_starved(), &inventory, &s, 0.1)
+            .0
+            .is_empty());
+    }
+
+    #[test]
+    fn the_per_cycle_cap_holds() {
+        let mut s = settings();
+        s.max_per_cycle = 1;
+        let inventory = held(&[("attack", 5.0), ("fury", 5.0)]);
+        assert_eq!(
+            consumables_to_use(&attack_starved(), &inventory, &s, 0.1)
+                .0
+                .len(),
+            1
+        );
+    }
+
+    // --- the gates on the three new actions, all reachable without a network ---
+
+    #[test]
+    fn the_new_actions_refuse_cleanly_when_disabled() {
+        let settings = Settings::default();
+        let (api, hive, keys) = parts(None);
+        let blacklist = HashSet::new();
+        let runner = runner_for(&api, &hive, &keys, &settings, &blacklist);
+
+        for reason in [
+            runner
+                .start_missions(&Player::default())
+                .unwrap()
+                .skipped_reason,
+            runner.open_crates().unwrap().skipped_reason,
+            runner
+                .use_consumables(&Player::default())
+                .unwrap()
+                .skipped_reason,
+        ] {
+            assert!(
+                reason.unwrap_or_default().contains("disabled"),
+                "a disabled action must say so rather than reaching the network"
+            );
+        }
+    }
+
+    #[test]
+    fn starting_missions_refuses_without_an_active_key() {
+        let mut settings = Settings::default();
+        settings.quest.start = true;
+        let (api, hive, keys) = parts(None);
+        let blacklist = HashSet::new();
+        let runner = runner_for(&api, &hive, &keys, &settings, &blacklist);
+
+        let reason = runner
+            .start_missions(&Player::default())
+            .unwrap()
+            .skipped_reason
+            .unwrap_or_default();
+        assert!(reason.contains("active key"), "{reason}");
+    }
+}
+
+#[cfg(test)]
+mod commitment_tests {
+    //! Two actions in one cycle can both spend liquid SCRAP, and the game reports
+    //! the pre-spend balance to the second of them. These cover the arithmetic that
+    //! stops them promising it twice.
+    use super::*;
+    use crate::config::Settings;
+
+    #[test]
+    fn a_wallet_built_for_spending_excludes_what_is_already_committed() {
+        // The shape `spend` builds before planning.
+        let liquid = 10_000.0;
+        for committed in [0.0f64, 2_500.0, 10_000.0, 25_000.0] {
+            let available = (liquid - committed.max(0.0)).max(0.0);
+            assert!(available <= liquid);
+            assert!(available >= 0.0, "committed {committed} went negative");
+        }
+        // Over-committing cannot conjure a negative balance for the planner.
+        assert_eq!((10_000.0f64 - 25_000.0f64).max(0.0), 0.0);
+    }
+
+    #[test]
+    fn the_planner_spends_less_when_told_something_is_already_committed() {
+        let mut s = Settings::default().spend;
+        s.enabled = true;
+        s.min_stash_hours = 0.0;
+        s.engineering.enabled = false;
+        s.favor.enabled = false;
+        s.stake.weight = 1.0;
+
+        let spent_of = |committed: f64| {
+            let wallet = Wallet {
+                liquid: (100_000.0f64 - committed).max(0.0),
+                stake: 10_000.0,
+                favor: 44_000.0,
+                engineering: 20.0,
+                damage: 500.0,
+                defense: 500.0,
+            };
+            plan(wallet, &s, 20.0, None)
+                .iter()
+                .map(|step| match step {
+                    Step::Stake { amount, .. }
+                    | Step::Favor { amount }
+                    | Step::Stat { amount, .. } => *amount,
+                })
+                .sum::<f64>()
+        };
+
+        let free = spent_of(0.0);
+        let constrained = spent_of(60_000.0);
+        assert!(free > constrained, "{free} should exceed {constrained}");
+        assert!(
+            constrained <= 40_000.0 + 1.0,
+            "spent {constrained} of 40,000 left"
+        );
+        // And with everything committed, nothing more is promised.
+        assert_eq!(spent_of(100_000.0), 0.0);
     }
 }
