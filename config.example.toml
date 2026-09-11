@@ -154,7 +154,12 @@ max_crit = 0.0           # 0 disables the cap
 
 [defaults.spend.stake]
 # Staking is not spending -- the SCRAP stays yours. It raises dodge, luck and the
-# stash ceiling, at the cost of the unstaking cooldown.
+# stash ceiling.
+#
+# The cost is time: unstaking SCRAP releases a quarter every 7 days and takes
+# 28 DAYS to complete (Hive-Engine unstakingCooldown 28 over 4 transactions), and
+# delegation is disabled. Staked SCRAP cannot be spent or sold until that runs, so
+# set min_scrap_reserve above to whatever you want to keep tradeable.
 enabled = true
 weight = 2.0
 max_scrap_per_dodge_point = 50000.0

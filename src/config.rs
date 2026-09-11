@@ -489,7 +489,13 @@ impl Default for FavorGoal {
 
 /// Staking is not spending: the SCRAP stays yours. It raises dodge, luck and the
 /// stash ceiling, so it is the natural home for anything the other goals cannot
-/// justify -- at the cost of the unstaking cooldown.
+/// justify.
+///
+/// The cost is time, and it is not small. Checked against Hive-Engine's `tokens`
+/// contract: SCRAP has `unstakingCooldown: 28` over `numberTransactions: 4`, so
+/// unstaking releases a quarter every seven days and takes **28 days** to finish.
+/// Delegation is disabled, so there is no route around it. Staked SCRAP is not
+/// spendable and not sellable until that runs.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct StakeGoal {

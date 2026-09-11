@@ -196,8 +196,10 @@ game's own curves rather than taste:
   in roughly as many days as your current level, so `max_payback_days` expresses the
   stopping point exactly and it self-limits near the cap.
 - **Staking is not spending.** The SCRAP stays yours; it buys dodge, luck and stash
-  ceiling for only the cost of the unstaking cooldown. Dodge is cheap to about 15%
-  (~130k staked) and then walls hard.
+  ceiling. Dodge is cheap to about 15% (~130k staked) and then walls hard. The cost
+  is time: **unstaking takes 28 days**, releasing a quarter every seven days
+  (Hive-Engine `unstakingCooldown` 28 over 4 transactions, delegation disabled), so
+  keep anything you might want to sell above `min_scrap_reserve`.
 - **Favor** buys crit and is burned for good. Its price is flat inside a band and
   doubles at every edge, so the ceiling is on the *marginal* price rather than a
   target percentage — `max_scrap_per_crit_point` stops at the next cliff wherever it
