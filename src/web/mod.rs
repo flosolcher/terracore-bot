@@ -8,7 +8,7 @@
 //! here and a change made in an editor are the same kind of change.
 
 mod auth;
-mod edit;
+pub(crate) mod edit;
 
 use std::io::Cursor;
 use std::net::ToSocketAddrs;

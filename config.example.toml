@@ -190,10 +190,12 @@ max_defense = 0.0
 # [accounts.youraccount.attack]
 # max_enemy_dodge = 40.0
 #
-# [accounts.youraccount.upgrade]
+# [accounts.youraccount.spend]
 # enabled = true
-# stats = ["engineering", "damage"]
 # min_scrap_reserve = 5000.0
+#
+# [accounts.youraccount.spend.favor]
+# weight = 2.0
 
 # ---------------------------------------------------------------------------
 # The local control panel (optional)

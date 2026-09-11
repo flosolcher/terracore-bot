@@ -57,6 +57,14 @@ enum Command {
     Once,
     /// Show what the bot sees for each account. Reads only.
     Status,
+    /// Suggest spending settings from an account's own numbers.
+    Recommend {
+        /// Limit to one account.
+        account: Option<String>,
+        /// Write the suggestion into the config and turn spending on.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Show who the bot would attack right now, and why it refused the rest.
     Targets {
         /// Limit to one account.
@@ -125,6 +133,9 @@ fn main() -> Result<()> {
         Command::Check => check(&cli),
         // No wallet, no passphrase, no broadcasts: safe to run anywhere.
         Command::Status => runner::status(&load_config(&cli)?),
+        Command::Recommend { account, apply } => {
+            recommend_command(&load_config(&cli)?, account.as_deref(), *apply)
+        }
         Command::Targets { account, limit } => {
             runner::targets(&load_config(&cli)?, account.as_deref(), *limit)
         }
@@ -227,6 +238,81 @@ fn check(cli: &Cli) -> Result<()> {
         println!();
     }
     Ok(())
+}
+
+/// Print the suggested spending settings, and optionally write them in.
+///
+/// The same engine and the same config writer the control panel uses, so the two
+/// cannot drift into disagreeing about what "recommended" means.
+fn recommend_command(config: &Config, only: Option<&str>, apply: bool) -> Result<()> {
+    let api = crate::api::Api::new(
+        &config.terracore.api,
+        std::time::Duration::from_secs(config.terracore.timeout_secs),
+        config.terracore.retries,
+    );
+
+    for account in &config.accounts {
+        if only.is_some_and(|want| !want.eq_ignore_ascii_case(&account.name)) {
+            continue;
+        }
+        let player = match api.player(&account.name) {
+            Ok(player) => player,
+            Err(e) => {
+                println!("@{}  unreachable: {e:#}\n", account.name);
+                continue;
+            }
+        };
+        let (mut suggested, notes) =
+            crate::recommend::spend_settings(&player, &account.settings.spend);
+
+        println!("@{}", account.name);
+        for note in &notes {
+            println!("  {} = {}", note.field, note.value);
+            for line in textwrap(&note.why, 74) {
+                println!("      {line}");
+            }
+        }
+
+        if !apply {
+            println!("\n  (nothing written; pass --apply to use these)\n");
+            continue;
+        }
+
+        suggested.enabled = true;
+        let text = std::fs::read_to_string(&config.path).context("reading the config")?;
+        let mut settings = account.settings.clone();
+        settings.spend = suggested;
+        let updated = web::edit::apply(&text, &account.name, &settings, account.enabled)?;
+        // Parsing before writing: a config the bot cannot load would stop it dead.
+        Config::from_str(&updated).context("the edited config would not load")?;
+        let temporary = config.path.with_extension("toml.tmp");
+        std::fs::write(&temporary, &updated)?;
+        std::fs::rename(&temporary, &config.path)?;
+        println!(
+            "\n  written to {} with spending enabled\n",
+            config.path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Wrap prose to a width, so a reason reads as a paragraph rather than one long line.
+fn textwrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && current.len() + 1 + word.len() > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 fn wallet(command: &WalletCommand, cli: &Cli) -> Result<()> {

@@ -66,6 +66,26 @@ pub fn spend_settings(player: &Player, current: &SpendSettings) -> (SpendSetting
     });
 
     // --- engineering ----------------------------------------------------
+    //
+    // The ceiling is not a fixed number of days. Engineering is normally the
+    // cheapest point on offer -- `e^2` against tens of thousands for a crit or dodge
+    // point -- and it stops deserving priority when it costs what the alternatives
+    // do. Solving `e^2 = cheapest alternative` gives the level where that happens,
+    // and its payback is the limit worth setting.
+    //
+    // A flat 60 looked reasonable and was not: an account at engineering 75 already
+    // has a 74-day payback, so 60 shut out the one goal it could actually afford and
+    // left nothing enabled at all.
+    let crit_point = curves::scrap_per_crit_point(player.favor);
+    let dodge_point = curves::scrap_per_dodge_point(player.hive_engine_stake);
+    let cheapest_alternative = crit_point.min(dodge_point);
+    let crossover = if cheapest_alternative.is_finite() {
+        cheapest_alternative.max(1.0).sqrt()
+    } else {
+        f64::from(u16::MAX)
+    };
+    let target_days = curves::engineering_payback_days(crossover).clamp(60.0, 365.0);
+
     let payback = curves::engineering_payback_days(player.engineering);
     if payback > HOPELESS_PAYBACK_DAYS {
         s.engineering.enabled = false;
@@ -80,20 +100,23 @@ pub fn spend_settings(player: &Player, current: &SpendSettings) -> (SpendSetting
         });
     } else {
         s.engineering.enabled = true;
-        s.engineering.max_payback_days = 60.0;
+        s.engineering.max_payback_days = round_nicely(target_days).max(60.0);
         notes.push(Note {
             field: "engineering.max_payback_days".into(),
-            value: "60".into(),
+            value: format!("{:.0}", s.engineering.max_payback_days),
             why: format!(
-                "a point currently repays in {payback:.0} days; below the game's 333 softcap \
-                 that figure is close to your level, so 60 keeps buying to about engineering 60"
+                "a point costs {:.0} now and repays in {payback:.0} days. Below the 333 softcap \
+                 the payback in days is about your level, so this keeps buying to roughly \
+                 engineering {:.0} -- the point where a point of engineering costs what a point \
+                 of crit or dodge costs you today ({cheapest_alternative:.0})",
+                curves::stat_cost(crate::config::Stat::Engineering, player.engineering),
+                s.engineering.max_payback_days,
             ),
         });
     }
 
     // --- favor ----------------------------------------------------------
     let crit_now = curves::crit_from_favor(player.favor);
-    let crit_point = curves::scrap_per_crit_point(player.favor);
     s.favor.max_scrap_per_crit_point = round_nicely(budget_per_point);
     if crit_point <= budget_per_point {
         let room = curves::favor_affordable(player.favor, s.favor.max_scrap_per_crit_point);
@@ -118,7 +141,6 @@ pub fn spend_settings(player: &Player, current: &SpendSettings) -> (SpendSetting
     }
 
     // --- stake ----------------------------------------------------------
-    let dodge_point = curves::scrap_per_dodge_point(player.hive_engine_stake);
     s.stake.max_scrap_per_dodge_point = round_nicely(budget_per_point);
     s.stake.absorb_surplus = false;
     notes.push(Note {
@@ -204,11 +226,46 @@ mod tests {
         assert!(notes.iter().any(|n| n.field == "engineering.enabled"));
     }
 
+    /// The account this was actually applied to, and the case that showed the flat
+    /// 60-day ceiling was wrong: engineering 75 has a 74-day payback, so a limit of
+    /// 60 closed the only goal it could afford and left nothing enabled at all.
+    #[test]
+    fn a_mid_account_is_not_left_with_every_goal_shut() {
+        let mut p = player(75.0, 44_000.0, 43_999.0);
+        p.hive_engine_scrap = 14_743.0;
+        let (s, _) = spend_settings(&p, &SpendSettings::default());
+
+        assert!(s.engineering.enabled);
+        assert!(
+            s.engineering.max_payback_days > curves::engineering_payback_days(75.0),
+            "the ceiling must leave room to buy: {} vs a payback of {:.0}",
+            s.engineering.max_payback_days,
+            curves::engineering_payback_days(75.0)
+        );
+
+        // And the whole thing must actually do something: at least one goal open.
+        let mut spend = s.clone();
+        spend.enabled = true;
+        let wallet = crate::actions::Wallet {
+            liquid: 14_743.0,
+            stake: 43_999.0,
+            favor: 44_000.0,
+            engineering: 75.0,
+            damage: 1294.0,
+            defense: 760.0,
+        };
+        let steps = crate::actions::plan(wallet, &spend, 75.0, None);
+        assert!(
+            !steps.is_empty(),
+            "the suggested config does nothing at all"
+        );
+    }
+
     #[test]
     fn a_young_account_is_told_to_buy_engineering() {
         let (s, _) = spend_settings(&player(20.0, 0.0, 0.0), &SpendSettings::default());
         assert!(s.engineering.enabled);
-        assert_eq!(s.engineering.max_payback_days, 60.0);
+        assert!(s.engineering.max_payback_days >= 60.0);
         // Mining 220 a day, so the ceilings are small -- not a copy of a big account's.
         assert!(
             s.favor.max_scrap_per_crit_point < 1_000.0,
